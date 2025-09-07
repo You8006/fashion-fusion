@@ -24,6 +24,18 @@ jobs:
         with:
           submodules: true
           lfs: false
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - name: Install & Build (manual)
+        run: |
+          npm ci
+          npm run build
+          if [ -d .next/cache ]; then rm -rf .next/cache; fi
+          echo 'Artifact size after trim:'
+          du -sh .next || true
       - name: Build And Deploy
         id: builddeploy
         uses: Azure/static-web-apps-deploy@v1
@@ -35,30 +47,12 @@ jobs:
           # For more information regarding Static Web App workflow configurations, please visit: https://aka.ms/swaworkflowconfig
           app_location: "/" # App source code path
           api_location: "" # Api source code path - optional
-          output_location: "" # Built app content directory - optional
+          # 明示: Next.js ビルド成果物ディレクトリ (.next) を指定し不要ファイルの推測アップロードを防ぐ
+          output_location: ".next" # Built app content directory
+          skip_app_build: true # 既に手動ビルド済み (.next)
           ###### End of Repository/Build Configurations ######
         env:
           NEXT_TELEMETRY_DISABLED: 1
-      - name: Post-deploy ping health check (api/genai?ping=1)
-        id: ping
-        continue-on-error: true
-        run: |
-          set -e
-          base="${{ steps.builddeploy.outputs.static_web_app_url }}"
-          echo "Check base URL: $base"
-          if [ -z "$base" ]; then
-            echo "No static_web_app_url output; skipping ping."; exit 0; fi
-          echo "Pinging $base/api/genai?ping=1"
-          success=0
-          for i in $(seq 1 15); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "$base/api/genai?ping=1") || code=000
-            echo "Attempt $i -> HTTP $code"
-            if [ "$code" = "200" ]; then
-              echo "--- Response ---"; curl -s "$base/api/genai?ping=1"; echo; success=1; break; fi
-            sleep 8
-          done
-          if [ $success -eq 0 ]; then
-            echo "Ping endpoint did not return 200 within attempts (non-blocking)."; fi
 
   close_pull_request_job:
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
