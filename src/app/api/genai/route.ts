@@ -12,7 +12,7 @@ export async function POST(req: NextRequest) {
   const log = (o: Record<string, unknown>) => {
     try {
       console.log(JSON.stringify({ id, ts: new Date().toISOString(), ...o }));
-    } catch (e) {
+    } catch {
       console.log('[log-failed]', id, o);
     }
   };
@@ -165,8 +165,13 @@ export async function POST(req: NextRequest) {
     };
     const started = Date.now();
     log({ t: 'fetch', phase: 'start', memRss: process.memoryUsage().rss, upstreamUrl });
-    let upstreamStatus: number | undefined;
-    let jsonAny: any = null;
+  let upstreamStatus: number | undefined;
+  // --- Minimal type definitions to avoid any ---
+  interface GeminiPart { inlineData?: { data?: string; mimeType?: string }; text?: string }
+  interface GeminiContent { role?: string; parts?: GeminiPart[] }
+  interface GeminiCandidate { content?: GeminiContent }
+  interface GeminiResponse { candidates?: GeminiCandidate[]; promptFeedback?: { blockReason?: string } }
+  let jsonAny: GeminiResponse | null = null;
     try {
       const upstreamRes = await fetch(upstreamUrl, {
         method: 'POST',
@@ -176,12 +181,12 @@ export async function POST(req: NextRequest) {
       upstreamStatus = upstreamRes.status;
       const text = await upstreamRes.text();
       const bodyLen = text.length;
-      let parsed: any = null;
+  let parsed: unknown = null;
       try { parsed = JSON.parse(text); } catch {
         log({ t: 'error', stage: 'upstream', kind: 'json_parse_fail', upstreamStatus, bodyLen });
         return new Response(JSON.stringify({ error: 'Upstream JSON parse failed', upstreamStatus, correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
       }
-      jsonAny = parsed;
+  jsonAny = parsed as GeminiResponse;
       const durationMs = Date.now() - started;
       log({ t: 'fetch', phase: 'end', ms: durationMs, upstreamStatus, bodyLen, memRss: process.memoryUsage().rss });
       if (!upstreamRes.ok) {
@@ -194,10 +199,10 @@ export async function POST(req: NextRequest) {
       return new Response(JSON.stringify({ error: 'Upstream call failed', upstreamStatus: upstreamStatus ?? null, correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
     }
     const durationMs = Date.now() - started;
-    const parts = jsonAny?.candidates?.[0]?.content?.parts || [];
+  const parts: GeminiPart[] = jsonAny?.candidates?.[0]?.content?.parts || [];
     const imgPart = parts.find((p: { inlineData?: { data?: string } }) => p?.inlineData?.data);
     if (!imgPart?.inlineData?.data) {
-      log({ t: 'error', stage: 'response', kind: 'no_image_part', upstreamStatus: jsonAny?.promptFeedback?.blockReason || jsonAny?.promptFeedback ? 'ok_no_image' : 'ok' });
+  log({ t: 'error', stage: 'response', kind: 'no_image_part', upstreamStatus: upstreamStatus });
       return new Response(JSON.stringify({ error: 'No image returned', upstreamStatus, correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
     }
     const imageBytes = base64Bytes(imgPart.inlineData.data);
@@ -213,7 +218,7 @@ export async function POST(req: NextRequest) {
     log({ t: 'result', imageBytes, durationMs, memRss: process.memoryUsage().rss });
     const totalMs = Date.now() - startedAll;
     log({ t: 'complete', totalMs, memRss: process.memoryUsage().rss });
-  return new Response(JSON.stringify({ imageB64: imgPart.inlineData.data, meta: { model, durationMs, upstreamStatus: 200, correlationId: id } }), { status: 200, headers: { 'X-Correlation-Id': id, 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify({ imageB64: imgPart.inlineData.data, meta: { model, durationMs, upstreamStatus: upstreamStatus || 200, correlationId: id } }), { status: 200, headers: { 'X-Correlation-Id': id, 'Content-Type': 'application/json' } });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
   log({ t: 'error', stage: 'unhandled', kind: 'unexpected', message, memRss: process.memoryUsage().rss });
