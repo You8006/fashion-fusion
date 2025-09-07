@@ -3,6 +3,7 @@
 import { useState, useCallback, useMemo } from 'react';
 // Remove direct GoogleGenAI usage; use server proxy
 import { callGenAI, callGenAIMultipart } from '@/lib/genai-client';
+import { optimizeImages } from '@/lib/compress-utils';
 import { buildCompositePrompt, buildItemColorGridPrompt } from '@/lib/prompt-builders';
 import { sizeFromFile, enforceSizeB64 as enforceSizeB64Strict, downloadB64PNG, clampLongEdgeSize } from '@/lib/size-utils';
 import { sliceGridB64, assembleGridB64 } from '@/lib/grid-utils';
@@ -54,14 +55,25 @@ export default function MiniPage() {
       if (!personFile || !itemFile) { setError('Select person + item images'); return; }
       if (!baseW || !baseH) { setError('Base size missing'); return; }
       setBusy(true);
-      const rawTotal = personFile.size + itemFile.size;
-      if (rawTotal > 3.9 * 1024 * 1024) {
-        setError(`Payload too large raw ${(rawTotal/1024/1024).toFixed(2)}MB (>3.9MB).`);
-        setBusy(false);
-        return;
+      let pFile = personFile; let iFile = itemFile;
+      let rawTotal = pFile.size + iFile.size;
+      const RAW_LIMIT = 3.9 * 1024 * 1024;
+      if (rawTotal > RAW_LIMIT) {
+        try {
+          const target = 3.4 * 1024 * 1024;
+          const { files, totalAfter, reducedPercent } = await optimizeImages([pFile, iFile], { targetTotalBytes: target, format: 'image/webp' });
+          pFile = files[0].optimized; iFile = files[1].optimized; rawTotal = totalAfter;
+          console.info('[mini optimizeImages] composite reduced', { reducedPercent: reducedPercent.toFixed(1), totalAfter });
+        } catch (e) {
+          console.warn('[mini optimizeImages] failed', e);
+        }
+      }
+      if (rawTotal > RAW_LIMIT) {
+        setError(`Payload too large even after optimize ${(rawTotal/1024/1024).toFixed(2)}MB (>3.9MB).`);
+        setBusy(false); return;
       }
       const prompt = buildCompositePrompt(baseW, baseH);
-      const res = await callGenAIMultipart({ prompt, files: [ { file: personFile }, { file: itemFile } ] });
+      const res = await callGenAIMultipart({ prompt, files: [ { file: pFile }, { file: iFile } ] });
       if (!res.imageB64) throw new Error('No image returned');
       const normalized = await enforceSizeB64Strict(res.imageB64, baseW, baseH, 'cover');
       setResultB64(normalized);
@@ -83,12 +95,20 @@ export default function MiniPage() {
         '#FF0000','#0055FF','#FFD700','#00B140','#7A00FF','#FF7A00','#000000','#FFFFFF','#808080'
       ], cellW, cellH);
       // First call (item color grid) can also use multipart (single file)
-      if (itemFile.size > 3.9 * 1024 * 1024) {
-        setError(`Item file too large ${(itemFile.size/1024/1024).toFixed(2)}MB (>3.9MB).`);
-        setBusy(false);
-        return;
+      let itemOptim = itemFile;
+      if (itemOptim.size > 3.9 * 1024 * 1024) {
+        try {
+          const target = 3.4 * 1024 * 1024;
+          const { files, totalAfter, reducedPercent } = await optimizeImages([itemOptim], { targetTotalBytes: target, format: 'image/webp' });
+          itemOptim = files[0].optimized;
+          console.info('[mini optimizeImages] item grid reduced', { reducedPercent: reducedPercent.toFixed(1), totalAfter });
+        } catch (e) { console.warn('[mini optimizeImages] item reduce failed', e); }
       }
-      const itemGridRes = await callGenAIMultipart({ prompt: itemPrompt, files: [ { file: itemFile } ] });
+      if (itemOptim.size > 3.9 * 1024 * 1024) {
+        setError(`Item file too large ${(itemOptim.size/1024/1024).toFixed(2)}MB (>3.9MB) after optimize.`);
+        setBusy(false); return;
+      }
+      const itemGridRes = await callGenAIMultipart({ prompt: itemPrompt, files: [ { file: itemOptim } ] });
       if (!itemGridRes.imageB64) throw new Error('Item color grid failed');
       const itemGridNorm = await enforceSizeB64Strict(itemGridRes.imageB64, cellW * 3, cellH * 3, 'cover');
       const itemCells = await sliceGridB64(itemGridNorm, 3, 3, cellW, cellH);

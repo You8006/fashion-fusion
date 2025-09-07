@@ -11,6 +11,7 @@ import { sizeHint } from "@/lib/prompt-size-hint";
 // Legacy prompt helpers removed (now unified via prompt-builders)
 import { buildCompositePrompt, buildColorGridPrompt } from "@/lib/prompt-builders";
 import { callGenAI, callGenAIMultipart } from "@/lib/genai-client";
+import { optimizeImages } from "@/lib/compress-utils";
 
 // Minimal structural type for Gemini image parts to avoid using 'any'
 interface GenAIInlinePart { inlineData?: { data?: string; mimeType?: string } }
@@ -123,15 +124,28 @@ export default function Page() {
       if (!baseW || !baseH) { setError("Failed to get person image size"); return; }
       setState("working");
       // Raw file size 合計で判定 (multipart 送信前)
-      const totalRaw = personFile.size + itemFile.size;
-      const RAW_WARN = 3.9 * 1024 * 1024; // ほぼ 4MB 手前の安全域
-      if (totalRaw > RAW_WARN) {
-        setError(`Payload too large raw ${(totalRaw/1024/1024).toFixed(2)}MB (>3.9MB). Please resize images.`);
+      let pFile = personFile; let iFile = itemFile;
+      let totalRaw = pFile.size + iFile.size;
+      const RAW_LIMIT = 3.9 * 1024 * 1024; // pre-server limit
+      if (totalRaw > RAW_LIMIT) {
+        // Try automatic optimization (target a bit below limit)
+        try {
+          const target = 3.4 * 1024 * 1024; // leave margin
+          const { files, totalAfter, reducedPercent } = await optimizeImages([pFile, iFile], { targetTotalBytes: target, maxLongEdge: 2048, format: 'image/webp' });
+          pFile = files[0].optimized; iFile = files[1].optimized;
+          totalRaw = totalAfter;
+          console.info('[optimizeImages] reduced', { reducedPercent: reducedPercent.toFixed(1), totalAfter });
+        } catch (e) {
+          console.warn('[optimizeImages] failed, using originals', e);
+        }
+      }
+      if (totalRaw > RAW_LIMIT) {
+        setError(`Payload too large even after optimize ${(totalRaw/1024/1024).toFixed(2)}MB (>3.9MB).`);
         setState('idle');
         return;
       }
       const prompt = buildCompositePrompt(baseW, baseH);
-      const response = await callGenAIMultipart({ prompt, files: [ { file: personFile }, { file: itemFile } ] });
+      const response = await callGenAIMultipart({ prompt, files: [ { file: pFile }, { file: iFile } ] });
       if (!response.imageB64) throw new Error('No image returned');
       const rawB64 = response.imageB64;
       let outW = baseW, outH = baseH;
