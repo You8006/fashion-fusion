@@ -1,4 +1,4 @@
-name: Azure Static Web Apps CI/CD (Static Export Next.js)
+name: Azure Static Web Apps CI/CD (Next.js SSR)
 
 on:
   push:
@@ -28,9 +28,9 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      - name: Build (Next.js Static Export)
+      - name: Build (Next.js SSR)
         run: npm run build
-      - name: Deploy (Static Files)
+      - name: Deploy (SSR Runtime)
         id: builddeploy
         uses: Azure/static-web-apps-deploy@v1
         with:
@@ -38,8 +38,8 @@ jobs:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           action: upload
           app_location: /
-          app_artifact_location: out
-          api_location: ""  # なし
+          # SSR: output_location 指定しない (.next を解析)
+          api_location: "" # Route Handlers 使用。Functions 追加時は 'api' を指定
           skip_api_build: true
 
   close_pull_request_job:

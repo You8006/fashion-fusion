@@ -1,13 +1,10 @@
 import type { NextConfig } from "next";
 
-// 静的サイト (SSG) / next export モード
-// 注意:
-//  - app/api/ 以下の Route Handler は使用できないため削除済み
-//  - 動的サーバ処理やシークレット利用は行えません
-//  - 生成系 API が必要な場合は Azure Functions 等を再導入してください
+// SSR (Route Handlers 有効) モード: output:'export' を削除し動的処理復活
+// Azure Static Web Apps Standard プランで Next.js SSR ランタイムを利用
 const nextConfig: NextConfig = {
-  output: 'export',
   images: { unoptimized: true },
+  // 必要なら experimental オプション等ここに追加
 };
 
 export default nextConfig;

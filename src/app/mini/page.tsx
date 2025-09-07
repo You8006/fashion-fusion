@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useMemo } from 'react';
 // Remove direct GoogleGenAI usage; use server proxy
-// import { callGenAI } from '@/lib/genai-client'; // static export: disabled
+import { callGenAI } from '@/lib/genai-client';
 import { buildCompositePrompt, buildItemColorGridPrompt } from '@/lib/prompt-builders';
 import { sizeFromFile, enforceSizeB64 as enforceSizeB64Strict, downloadB64PNG, clampLongEdgeSize } from '@/lib/size-utils';
 import { sliceGridB64, assembleGridB64 } from '@/lib/grid-utils';
@@ -49,12 +49,54 @@ export default function MiniPage() {
   }, []);
 
   const generateComposite = useCallback(async () => {
-    setError('Generation disabled in static export build.');
-  }, []);
+    try {
+      setError('');
+      if (!personFile || !itemFile) { setError('Select person + item images'); return; }
+      if (!baseW || !baseH) { setError('Base size missing'); return; }
+      setBusy(true);
+      const person = await toInline(personFile);
+      const item = await toInline(itemFile);
+      const prompt = buildCompositePrompt(baseW, baseH);
+      const res = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
+      if (!res.imageB64) throw new Error('No image returned');
+      const normalized = await enforceSizeB64Strict(res.imageB64, baseW, baseH, 'cover');
+      setResultB64(normalized);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally { setBusy(false); }
+  }, [personFile, itemFile, baseW, baseH, toInline]);
 
   const generateColorGrid = useCallback(async () => {
-    setError('Color grid generation disabled in static export build.');
-  }, []);
+    try {
+      setError('');
+      if (!personFile || !itemFile) { setError('Select person + item images'); return; }
+      if (!baseW || !baseH) { setError('Base size missing'); return; }
+      setBusy(true);
+      const cellW = baseW; const cellH = baseH;
+      const itemPrompt = buildItemColorGridPrompt([
+        '#FF0000','#0055FF','#FFD700','#00B140','#7A00FF','#FF7A00','#000000','#FFFFFF','#808080'
+      ], cellW, cellH);
+      const itemInline = await toInline(itemFile);
+      const itemGridRes = await callGenAI({ prompt: itemPrompt, images: [ { data: itemInline.inlineData.data!, mimeType: itemInline.inlineData.mimeType } ] });
+      if (!itemGridRes.imageB64) throw new Error('Item color grid failed');
+      const itemGridNorm = await enforceSizeB64Strict(itemGridRes.imageB64, cellW * 3, cellH * 3, 'cover');
+      const itemCells = await sliceGridB64(itemGridNorm, 3, 3, cellW, cellH);
+      if (itemCells.length !== 9) throw new Error('Failed to slice 9 cells');
+      const personInline = await toInline(personFile);
+      const compositeCells: string[] = [];
+      for (let i = 0; i < 9; i++) {
+        const compPrompt = buildCompositePrompt(cellW, cellH) + '\nMODE=single_color_variant_cell index=' + i;
+        const compRes = await callGenAI({ prompt: compPrompt, images: [ { data: personInline.inlineData.data!, mimeType: personInline.inlineData.mimeType }, { data: itemCells[i], mimeType: 'image/png' } ] });
+        if (!compRes.imageB64) throw new Error('Cell composite failed');
+        const norm = await enforceSizeB64Strict(compRes.imageB64, cellW, cellH, 'cover');
+        compositeCells.push(norm);
+      }
+      const finalGrid = await assembleGridB64(compositeCells, 3, 3, cellW, cellH);
+      setColorGridB64(finalGrid);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally { setBusy(false); }
+  }, [personFile, itemFile, baseW, baseH, toInline]);
 
   return (
     <main style={{ maxWidth: 1024, margin: '0 auto', padding: '24px 28px', fontFamily: 'system-ui, sans-serif' }}>
