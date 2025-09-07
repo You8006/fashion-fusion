@@ -60,7 +60,7 @@ npm run export  # Next 15 では build 内で export され out/ 生成 (output:
 
 1. `api/generate` Azure Function (Node.js, isolated or v4) を追加
 2. フロントからは `/api/generate` に FormData (画像+指示文) 送信
-3. Function 内で Gemini SDK 呼び出し (API キーはフロントに公開しない App Setting `GEMINI_API_KEY`)
+3. Function 内で Gemini SDK 呼び出し (API キーはフロントに公開しない App Setting `NEXT_PUBLIC_GEMINI_API_KEY`)
 4. 画像サイズ/ファイルタイプ検証 & レートリミット (例: IP ベース簡易トークンバケット)
 5. 返却 JSON `{ imageBase64: "..." }`
 6. フロント側は `fetch('/api/generate')` へ差し替え

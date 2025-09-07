@@ -2,9 +2,9 @@ import { GoogleGenAI } from "@google/genai";
 import { writeFileSync } from "node:fs";
 
 async function main() {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
+  const apiKey = process.env.GEMINI_API_KEY || "";
   if (!apiKey) {
-    console.error("Set GEMINI_API_KEY or NEXT_PUBLIC_GEMINI_API_KEY first.");
+    console.error("Set GEMINI_API_KEY in your environment (.env.local) before running.");
     process.exit(1);
   }
   const ai = new GoogleGenAI({ apiKey });

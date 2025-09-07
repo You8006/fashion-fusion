@@ -23,16 +23,29 @@ export async function enforceSizeB64(srcB64: string, W: number, H: number, fit: 
   img.src = `data:image/png;base64,${srcB64}`;
   await img.decode();
   const sw = img.naturalWidth; const sh = img.naturalHeight;
-  const s = (fit === 'cover') ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
-  const dw = sw * s; const dh = sh * s;
-  const dx = (W - dw) / 2; const dy = (H - dh) / 2;
+  // キャンバスサイズは常に指定された (W,H) を使用し、人物基準のアスペクト比を固定
+  const targetAspect = W / H;
+  const srcAspect = sw / sh;
+  // cover: 余白を残さずトリミング / contain: 余白(透明)を許容
+  const scale = (fit === 'cover') ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
+  const dw = Math.round(sw * scale);
+  const dh = Math.round(sh * scale);
+  const dx = Math.round((W - dw) / 2);
+  const dy = Math.round((H - dh) / 2);
   const canvas = document.createElement('canvas');
   canvas.width = W; canvas.height = H;
-  const g = canvas.getContext('2d')!;
+  const g = canvas.getContext('2d');
+  if (!g) throw new Error('Canvas 2D context unavailable');
   g.imageSmoothingEnabled = true;
-  (g as any).imageSmoothingQuality = 'high';
+  if (typeof (g as CanvasRenderingContext2D & { imageSmoothingQuality?: string }).imageSmoothingQuality !== 'undefined') {
+    (g as CanvasRenderingContext2D & { imageSmoothingQuality?: string }).imageSmoothingQuality = 'high';
+  }
   g.clearRect(0, 0, W, H);
   g.drawImage(img, dx, dy, dw, dh);
+  // デバッグ用に大きく乖離する場合はコンソール通知（比率強制が効いたか確認）
+  if (Math.abs(srcAspect - targetAspect) > 0.01) {
+    console.info('[enforceSizeB64] aspect forced', { srcAspect, targetAspect, fit, canvas: { W, H }, draw: { dw, dh, dx, dy } });
+  }
   return canvas.toDataURL('image/png').split(',')[1];
 }
 

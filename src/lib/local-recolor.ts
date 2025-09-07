@@ -41,8 +41,10 @@ export function makeCanvas(w: number, h: number, dpr = 1): { canvas: HTMLCanvasE
       ctx.scale(dpr, dpr);
     }
   }
-  (ctx as any).imageSmoothingEnabled = true;
-  (ctx as any).imageSmoothingQuality = 'high';
+  (ctx as CanvasRenderingContext2D).imageSmoothingEnabled = true;
+  if ('imageSmoothingQuality' in ctx) {
+    (ctx as CanvasRenderingContext2D & { imageSmoothingQuality?: ImageSmoothingQuality }).imageSmoothingQuality = 'high';
+  }
   return { canvas, ctx };
 }
 
@@ -115,12 +117,18 @@ export async function recolorWithMaskMobileSafe(baseB64: string, maskB64: string
   const { width, height, dpr = 1 } = opt;
   const { canvas, ctx } = makeCanvas(width, height, dpr);
   ctx.drawImage(baseImg, 0, 0, width, height);
-  if (!maskImg) return typeof canvas === 'string' ? canvas : (canvas as any).toDataURL?.('image/png').split(',')[1];
+  if (!maskImg) {
+    if (canvas instanceof OffscreenCanvas) {
+      const blob = await canvas.convertToBlob({ type: 'image/png' });
+      return await blobToB64(blob);
+    }
+    return (canvas as HTMLCanvasElement).toDataURL('image/png').split(',')[1];
+  }
 
   const mainSupports = supportsGCO('color');
   // Draw garment area only (mask) into temp
   const { canvas: maskCanvas, ctx: maskCtx } = makeCanvas(width, height, dpr);
-  maskCtx.drawImage(maskImg as any, 0, 0, width, height);
+  maskCtx.drawImage(maskImg as HTMLImageElement | ImageBitmap, 0, 0, width, height);
   // Extract mask data
   const imageData = maskCtx.getImageData(0, 0, width, height);
   const data = imageData.data;
@@ -139,7 +147,7 @@ export async function recolorWithMaskMobileSafe(baseB64: string, maskB64: string
     ctx.fillStyle = `rgb(${tr} ${tg} ${tb})`;
     ctx.fillRect(0, 0, width, height);
     ctx.globalCompositeOperation = 'destination-in';
-    ctx.drawImage(maskCanvas as any, 0, 0, width, height);
+  ctx.drawImage(maskCanvas as HTMLCanvasElement | OffscreenCanvas, 0, 0, width, height);
     ctx.restore();
     ctx.globalCompositeOperation = 'source-over';
     // Re-draw base under tinted area with mask composite
@@ -151,7 +159,7 @@ export async function recolorWithMaskMobileSafe(baseB64: string, maskB64: string
     ctx.fillStyle = `rgb(${tr} ${tg} ${tb})`;
     ctx.fillRect(0, 0, width, height);
     ctx.globalCompositeOperation = 'screen';
-    ctx.drawImage(maskCanvas as any, 0, 0, width, height);
+  ctx.drawImage(maskCanvas as HTMLCanvasElement | OffscreenCanvas, 0, 0, width, height);
     ctx.restore();
     ctx.globalCompositeOperation = 'source-over';
   }
@@ -199,8 +207,10 @@ export async function assembleGrid(cells: string[], opt: GridAssembleOptions): P
   const totalW = cellWidth * cols + gap * (cols + 1);
   const totalH = cellHeight * rows + gap * (rows + 1);
   const { canvas, ctx } = makeCanvas(totalW, totalH, dpr);
-  (ctx as any).imageSmoothingEnabled = true;
-  (ctx as any).imageSmoothingQuality = 'high';
+  (ctx as CanvasRenderingContext2D).imageSmoothingEnabled = true;
+  if ('imageSmoothingQuality' in ctx) {
+    (ctx as CanvasRenderingContext2D & { imageSmoothingQuality?: ImageSmoothingQuality }).imageSmoothingQuality = 'high';
+  }
   ctx.fillStyle = background;
   ctx.fillRect(0, 0, totalW, totalH);
   for (let r = 0; r < rows; r++) {
@@ -210,7 +220,7 @@ export async function assembleGrid(cells: string[], opt: GridAssembleOptions): P
       const img = await loadImageFromB64(cells[idx]);
       const x = gap + c * (cellWidth + gap);
       const y = gap + r * (cellHeight + gap);
-      ctx.drawImage(img as any, x, y, cellWidth, cellHeight);
+  ctx.drawImage(img as HTMLImageElement | ImageBitmap, x, y, cellWidth, cellHeight);
     }
   }
   if (canvas instanceof OffscreenCanvas) {

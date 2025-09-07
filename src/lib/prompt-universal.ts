@@ -1,5 +1,4 @@
-// Universal prompt for one-pass auto classification + composition
-// 人物 + ファッションアイテム(種類自動判別) 合成用
+// Universal prompt for one-pass auto classification + composition (person + fashion item)
 export const UNIVERSAL_PROMPT = `
 You are a professional fashion compositor.
 You receive two images: [Image1]=person photo, [Image2]=a fashion item (hat, sunglasses, top, pants, dress, skirt, logo, shoes, bag, etc.).
@@ -24,5 +23,5 @@ Placement rules:
 Extra:
 - If Image2 has a plain white background, segment it cleanly before compositing.
 - Avoid adding any text, watermarks, or borders yourself.
-- Target size ≈ 1024×1024.
+- Preserve the original person image aspect ratio (this will be specified separately). Do NOT force a square output and do NOT pad with bars.
 `;

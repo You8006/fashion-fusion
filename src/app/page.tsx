@@ -1,25 +1,37 @@
 "use client";
 
 import { useCallback, useMemo, useRef, useState } from "react";
-import { PALETTES, PaletteId } from "@/lib/palettes";
-// ローカル再配色パスは削除し、クラウド(モデル)生成のみ利用
+import { PaletteId } from "@/lib/palettes";
+import { UploadArea } from "./components/UploadArea";
+import { ResultPanel } from "./components/ResultPanel";
+import { HighResPanel } from "./components/HighResPanel";
+// Local recolor path removed – only cloud (model) generation is used now
 import { sizeFromFile, sizeFromB64, enforceSizeB64 as enforceSizeB64Strict, downloadB64PNG, clampLongEdgeSize } from "@/lib/size-utils";
 import { sizeHint } from "@/lib/prompt-size-hint";
-// 色バリエーションではなくポーズバリエーションへ変更
-import { poseGridPrompt, hiResPosePrompt } from "@/lib/prompt-poses";
-import { colorGridPrompt } from "@/lib/prompt-variations";
-import { UNIVERSAL_PROMPT } from "@/lib/prompt-universal";
-import { GoogleGenAI } from "@google/genai";
+// Legacy prompt helpers removed (now unified via prompt-builders)
+import { buildCompositePrompt, buildPoseGridPrompt, buildColorGridPrompt, buildHiResPosePrompt, buildGarmentMaskPrompt } from "@/lib/prompt-builders";
+// Removed direct GoogleGenAI usage on client; now proxied via /api/genai
+import { callGenAI } from "@/lib/genai-client";
+
+// Minimal structural type for Gemini image parts to avoid using 'any'
+interface GenAIInlinePart { inlineData?: { data?: string; mimeType?: string } }
 
 type UIState = "idle" | "working" | "done" | "error";
 
 export default function Page() {
+  // Drag-over state is managed inside UploadArea now
   const [personFile, setPersonFile] = useState<File | null>(null);
   const [itemFile, setItemFile] = useState<File | null>(null);
   const [resultB64, setResultB64] = useState("");
+  // Final adopted composite size (if model output diverges from base person size)
+  const [compW, setCompW] = useState(0);
+  const [compH, setCompH] = useState(0);
   const [poseGridB64, setPoseGridB64] = useState("");
   const [colorGridB64, setColorGridB64] = useState("");
+  const [garmentMaskB64, setGarmentMaskB64] = useState(""); // API-generated binary mask (white garment / black non-garment)
   const [generatingColor, setGeneratingColor] = useState(false);
+  const [colorProgress, setColorProgress] = useState<number>(0); // 0..9
+  // (Legacy removed) itemColorGridB64 no longer needed; two-call pipeline is: (1) composite, (2) recolor grid
   const [state, setState] = useState<UIState>("idle");
   const [error, setError] = useState("");
   const [paletteId, setPaletteId] = useState<PaletteId>("classic9");
@@ -29,55 +41,72 @@ export default function Page() {
   const [personH, setPersonH] = useState<number>(0);
   const [itemW, setItemW] = useState<number>(0);
   const [itemH, setItemH] = useState<number>(0);
-  // 高画質単体出力
+  // Fullscreen image viewer state
+  const [fullscreen, setFullscreen] = useState<{ kind: 'composite' | 'poseGrid' | 'colorGrid'; b64: string } | null>(null);
+  // High-res single cell output
   const [hiResPoseB64, setHiResPoseB64] = useState("");
-  const [hiResIndex, setHiResIndex] = useState<number | null>(null); // 選択セル
+  const [hiResIndex, setHiResIndex] = useState<number | null>(null); // selected cell index
   const [hiResLoading, setHiResLoading] = useState(false);
   const [hiResW, setHiResW] = useState(0);
   const [hiResH, setHiResH] = useState(0);
-  const personInputRef = useRef<HTMLInputElement | null>(null);
-  const itemInputRef = useRef<HTMLInputElement | null>(null);
+  // Which grid type to upscale (pose or color)
+  const [hiResSource, setHiResSource] = useState<'pose' | 'color'>('pose');
+  const hiResSourceRef = useRef<'pose' | 'color'>('pose');
+  const setHiResSourceImmediate = (v: 'pose' | 'color') => { hiResSourceRef.current = v; setHiResSource(v); };
+  // Input refs are retained inside UploadArea component
 
+  // Some drag sources yield empty or generic MIME (application/octet-stream); fall back to extension
   const handleFilePick = useCallback(async (kind: "person" | "item", files: FileList | null) => {
     const file = files?.[0];
     if (!file) return;
-    if (!file.type.startsWith("image/")) { setError("画像ファイルを選択してください"); return; }
+  const mime = file.type; // e.g. "image/png" / "" / "application/octet-stream"
+    const nameLower = (file.name || "").toLowerCase();
+    const extMatch = nameLower.match(/\.([a-z0-9]+)$/);
+    const ext = extMatch ? extMatch[1] : "";
+    const EXT_WHITELIST = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "heif", "tif", "tiff"]);
+    const looksImageByExt = EXT_WHITELIST.has(ext);
+    const looksImageByMime = mime.startsWith("image/");
+    if (!looksImageByMime && !looksImageByExt) {
+      console.warn("Rejected file (not image)", { name: file.name, type: file.type, size: file.size });
+  setError("Please select an image file");
+      return;
+    }
+  // Debug: MIME fallback info (for user issue tracing)
+    if (!looksImageByMime && looksImageByExt) {
+  console.info("MIME fallback allowed by extension", { name: file.name, inferredExt: ext, originalType: file.type });
+    }
     if (kind === "person") {
       setPersonFile(file);
-      // 基準サイズ記録（人物）
+  // Record base size (person)
       const { w, h } = await sizeFromFile(file);
       const { w: cw, h: ch } = clampLongEdgeSize(w, h, 2048);
       setBaseW(cw); setBaseH(ch);
-  setPersonW(cw); setPersonH(ch);
+      setPersonW(cw); setPersonH(ch);
     } else {
       setItemFile(file);
-  const { w, h } = await sizeFromFile(file);
-  setItemW(w); setItemH(h);
+      const { w, h } = await sizeFromFile(file);
+      setItemW(w); setItemH(h);
     }
   }, []);
 
-  const buildDropHandlers = (kind: "person" | "item") => ({
-    onDragOver: (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; },
-    onDrop: (e: React.DragEvent) => { e.preventDefault(); handleFilePick(kind, e.dataTransfer.files); },
-    onClick: () => { (kind === "person" ? personInputRef : itemInputRef).current?.click(); }
-  });
+  // Old drop handler moved to UploadArea
 
-  const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
-  const ai = useMemo(() => (apiKey ? new GoogleGenAI({ apiKey }) : null), [apiKey]);
+  // APIキーはクライアントに出さない。存在チェックはサーバ応答エラーで判断。
+  const ai = null;
 
   const toInlineData = useCallback(async (f: File) => {
-    const MAX_BYTES = 8 * 1024 * 1024; // 8MB 上限
+    const MAX_BYTES = 8 * 1024 * 1024; // 8MB limit
     if (f.size > MAX_BYTES) {
-      throw new Error(`ファイルが大きすぎます (${(f.size / 1024 / 1024).toFixed(2)}MB) 上限 ${(MAX_BYTES / 1024 / 1024)}MB`);
+      throw new Error(`File too large (${(f.size / 1024 / 1024).toFixed(2)}MB) – limit ${(MAX_BYTES / 1024 / 1024)}MB`);
     }
     const b64 = await new Promise<string>((resolve, reject) => {
       const reader = new FileReader();
-      reader.onerror = () => reject(new Error("ファイル読み込みに失敗しました"));
+      reader.onerror = () => reject(new Error("Failed to read file"));
       reader.onload = () => {
         const result = reader.result;
-        if (typeof result !== "string") return reject(new Error("データURL取得に失敗"));
+        if (typeof result !== "string") return reject(new Error("Failed to obtain data URL"));
         const comma = result.indexOf(",");
-        if (comma === -1) return reject(new Error("Base64形式を解析できません"));
+        if (comma === -1) return reject(new Error("Cannot parse Base64 format"));
         resolve(result.slice(comma + 1));
       };
       reader.readAsDataURL(f);
@@ -85,119 +114,197 @@ export default function Page() {
     return { inlineData: { mimeType: f.type || "image/png", data: b64 } };
   }, []);
 
+  // === Sampling utilities (非衣服領域の色保持) ===
+  async function sampleBorderRGB(b64: string, w: number, h: number): Promise<{ r:number; g:number; b:number }> {
+    return await new Promise((resolve, reject) => {
+      try {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
+            const ctx = canvas.getContext('2d'); if (!ctx) return reject(new Error('Canvas 2D unavailable'));
+            ctx.drawImage(img, 0, 0, w, h);
+            const strip = Math.max(4, Math.round(Math.min(w, h) * 0.02));
+            const data = ctx.getImageData(0, 0, w, h).data;
+            let sr=0,sg=0,sb=0,cnt=0;
+            const push=(x:number,y:number)=>{const i=(y*w+x)*4; sr+=data[i]; sg+=data[i+1]; sb+=data[i+2]; cnt++;};
+            for (let x=0;x<w;x++){for(let y=0;y<strip;y++)push(x,y);for(let y=h-strip;y<h;y++)push(x,y);} 
+            for (let y=strip;y<h-strip;y++){for(let x=0;x<strip;x++)push(x,y);for(let x=w-strip;x<w;x++)push(x,y);} 
+            resolve({ r:Math.round(sr/cnt), g:Math.round(sg/cnt), b:Math.round(sb/cnt) });
+          } catch(err){ reject(err instanceof Error?err:new Error('Border sampling failed')); }
+        };
+        img.onerror=()=>reject(new Error('Image decode failed'));
+        img.src=`data:image/png;base64,${b64}`;
+      } catch(e){ reject(e instanceof Error?e:new Error('Border sampling error')); }
+    });
+  }
+
+  async function sampleFaceApproxRGB(b64: string, w: number, h: number): Promise<{ r:number; g:number; b:number }> {
+    return await new Promise((resolve, reject) => {
+      try {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
+            const ctx = canvas.getContext('2d'); if (!ctx) return reject(new Error('Canvas 2D unavailable'));
+            ctx.drawImage(img,0,0,w,h);
+            const fx=Math.round(w*0.3), fw=Math.round(w*0.4); const fy=Math.round(h*0.08), fh=Math.round(h*0.22);
+            const data=ctx.getImageData(fx,fy,fw,fh).data; let sr=0,sg=0,sb=0; const len=data.length/4; for(let i=0;i<data.length;i+=4){sr+=data[i];sg+=data[i+1];sb+=data[i+2];}
+            resolve({ r:Math.round(sr/len), g:Math.round(sg/len), b:Math.round(sb/len)});
+          } catch(err){ reject(err instanceof Error?err:new Error('Face sampling failed')); }
+        };
+        img.onerror=()=>reject(new Error('Image decode failed'));
+        img.src=`data:image/png;base64,${b64}`;
+      } catch(e){ reject(e instanceof Error?e:new Error('Face sampling error')); }
+    });
+  }
+
   const run = useCallback(async () => {
     try {
       setError("");
-      if (!apiKey) { setError("APIキーが設定されていません (.env.local) "); return; }
-  if (!personFile || !itemFile) { setError("人物画像とアイテム画像を両方選択してください"); return; }
-  if (!baseW || !baseH) { setError("人物画像サイズ取得に失敗"); return; }
+  // APIキーはサーバ側。ここでは不要。
+  if (!personFile || !itemFile) { setError("Please select both a person image and an item image"); return; }
+  if (!baseW || !baseH) { setError("Failed to get person image size"); return; }
       setState("working");
       const person = await toInlineData(personFile);
       const item = await toInlineData(itemFile);
-  const contents = [{ text: `${UNIVERSAL_PROMPT}\n${sizeHint(baseW, baseH)}` }, person, item];
-      const response = await ai!.models.generateContent({ model: "gemini-2.5-flash-image-preview", contents });
-      type Part = { inlineData?: { data?: string } };
-      const parts: Part[] = (response.candidates?.[0]?.content?.parts ?? []) as Part[];
-      const imgPart = parts.find(p => p.inlineData?.data);
-      if (!imgPart?.inlineData?.data) throw new Error("画像が返りませんでした");
-  // 返却画像を強制リサイズ（モデルがサイズを守らないケースに備える）
-  const normalized = await enforceSizeB64Strict(imgPart.inlineData.data, baseW, baseH, 'cover');
-  setResultB64(normalized);
-      setState("done");
+  // Single attempt
+      const prompt = buildCompositePrompt(baseW, baseH);
+  const response = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
+  if (!response.imageB64) throw new Error('No image returned');
+  const rawB64 = response.imageB64;
+  // Obtain model output size
+      let outW = baseW, outH = baseH;
+      try {
+        const { w, h } = await sizeFromB64(rawB64);
+        outW = w; outH = h;
+      } catch (e) {
+        console.warn('[composite] sizeFromB64 failed, using base size', e);
+      }
+      const outAspect = outW / outH;
+      const baseAspect = baseW / baseH;
+      const aspectDiff = Math.abs(outAspect - baseAspect);
+      if (aspectDiff <= 0.04) {
+  // Close aspect ratio → normalize to base size
+        const normalized = await enforceSizeB64Strict(rawB64, baseW, baseH, 'cover');
+        setResultB64(normalized);
+        setCompW(baseW); setCompH(baseH);
+      } else {
+  // Divergent → adopt model output aspect (scale down if >2048)
+        let finalW = outW, finalH = outH;
+        const longEdge = Math.max(finalW, finalH);
+        let finalB64 = rawB64;
+        if (longEdge > 2048) {
+          const s = 2048 / longEdge;
+          finalW = Math.round(finalW * s);
+          finalH = Math.round(finalH * s);
+          const img = new Image();
+          img.src = `data:image/png;base64,${rawB64}`;
+          await new Promise(res => { img.onload = () => res(null); });
+          const canvas = document.createElement('canvas');
+          canvas.width = finalW; canvas.height = finalH;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0, finalW, finalH);
+            finalB64 = canvas.toDataURL('image/png').split(',')[1];
+          }
+        }
+        setResultB64(finalB64);
+        setCompW(finalW); setCompH(finalH);
+        console.warn('[composite] adopt model aspect', { outW, outH, baseW, baseH });
+      }
+      setState('done');
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
-      setState("error");
+      setState('error');
     }
-  }, [apiKey, ai, personFile, itemFile, toInlineData]);
+  }, [personFile, itemFile, toInlineData, baseW, baseH]);
 
-  const generatePoseGrid = useCallback( async () => {
+  const generatePoseGrid = useCallback(async () => {
     try {
       setError("");
-      if (!resultB64) { setError("先に合成画像を生成してください"); return; }
-      if (!baseW || !baseH) { setError("基準サイズ未取得"); return; }
-      if (!apiKey) { setError("APIキー未設定"); return; }
-      setState("working");
-      const parts: any[] = [
-        { text: `${poseGridPrompt(baseW, baseH)}\n${sizeHint(baseW*3, baseH*3)}` },
-        { inlineData: { mimeType: 'image/png', data: resultB64 } }
-      ];
-      if (itemFile) {
-        const itemInline = await toInlineData(itemFile);
-        parts.push(itemInline);
+      if (!resultB64) { setError('Generate a composite first'); return; }
+      if (!baseW || !baseH) { setError('Base size not available'); return; }
+  // key handled server-side
+      setState('working');
+      const cellW = compW || baseW; const cellH = compH || baseH;
+      const gridW = cellW * 3; const gridH = cellH * 3;
+      const posePrompt = buildPoseGridPrompt(cellW, cellH) + '\nMODE=pose_variations_from_composite';
+      interface InlinePart { inlineData: { mimeType: string; data: string } }
+      interface TextPart { text: string }
+      type ContentPart = InlinePart | TextPart;
+      // Use the already generated composite as the single reference image
+      const compositeInline: InlinePart = { inlineData: { mimeType: 'image/png', data: resultB64 } };
+      const parts: ContentPart[] = [ { text: posePrompt }, compositeInline ];
+  const res = await callGenAI({ prompt: posePrompt, images: [ { data: resultB64, mimeType: 'image/png' } ] });
+  if (!res.imageB64) throw new Error('Pose grid not returned');
+  const raw = res.imageB64;
+      const normalized = await enforceSizeB64Strict(raw, gridW, gridH, 'cover');
+      const { w: gotW, h: gotH } = await sizeFromB64(normalized);
+      const colInt = Math.round(gotW / cellW); const rowInt = Math.round(gotH / cellH);
+      if (!(gotW === gridW && gotH === gridH && colInt === 3 && rowInt === 3)) {
+        throw new Error(`Not 3x3 (${colInt}x${rowInt})`);
       }
-      const res = await ai!.models.generateContent({ model: 'gemini-2.5-flash-image-preview', contents: parts });
-      const gridPart = (res.candidates?.[0]?.content?.parts || []).find((p: any)=> p.inlineData?.data);
-      if(!gridPart?.inlineData?.data) throw new Error('ポーズグリッドが返りませんでした');
-      const rawB64 = gridPart.inlineData.data;
-      const { w: rawW, h: rawH } = await sizeFromB64(rawB64);
-      const colsApprox = Math.round(rawW / baseW);
-      const rowsApprox = Math.round(rawH / baseH);
-      const ok = Math.abs(rawW - baseW*3) <= 2 && Math.abs(rawH - baseH*3) <= 2 && colsApprox === 3 && rowsApprox === 3;
-      if (!ok) {
-        // 不一致でもそのまま表示 (ユーザ要求) - サイズ強制せずオリジナル
-        console.warn(`Pose grid layout mismatch (expected 3x3). Detected ~${colsApprox}x${rowsApprox} px:${rawW}x${rawH}`);
-        setPoseGridB64(rawB64); // そのまま保存
-        setState('done');
-        return;
-      }
-      const normalizedGrid = await enforceSizeB64Strict(rawB64, baseW*3, baseH*3, 'cover');
-      setPoseGridB64(normalizedGrid);
+      setPoseGridB64(normalized);
       setState('done');
-    } catch(e) {
+    } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg); setState('error');
     }
-  }, [apiKey, ai, resultB64, baseW, baseH, itemFile, toInlineData]);
+  }, [resultB64, baseW, baseH, compW, compH]);
 
-  // 単体高画質バリエーション生成 (指定インデックス / パレットの色)
+  // High-res single-cell variation generation (specified index / palette color)
   const generateHighResPose = useCallback(async (idx: number) => {
     try {
       setError("");
-      if (!apiKey) { setError("APIキー未設定"); return; }
-      if (!poseGridB64) { setError("ポーズグリッドがありません"); return; }
-      if (!baseW || !baseH) { setError("基準サイズ未取得"); return; }
-      if (idx < 0 || idx > 8) { setError("インデックス不正"); return; }
+  // server will hold key
+  // Which grid to crop from (use latest selection via ref)
+      const source = hiResSourceRef.current;
+      const gridB64 = source === 'pose' ? poseGridB64 : colorGridB64;
+  if (!gridB64) { setError(source === 'pose' ? "No pose grid" : "No color grid"); return; }
+  if (!baseW || !baseH) { setError("Base size not available"); return; }
+  if (idx < 0 || idx > 8) { setError("Invalid index"); return; }
       setHiResLoading(true);
       setHiResPoseB64("");
       setHiResIndex(idx);
-      // アップスケール倍率 (過度な拡大を避けつつ画質向上)
-      const upscale = (Math.max(baseW, baseH) >= 1100) ? 1.25 : 2;
-      let targetW = Math.round(baseW * upscale);
-      let targetH = Math.round(baseH * upscale);
+      const baseForHiResW = compW || baseW;
+      const baseForHiResH = compH || baseH;
+      const upscale = (Math.max(baseForHiResW, baseForHiResH) >= 1100) ? 1.25 : 2;
+      let targetW = Math.round(baseForHiResW * upscale);
+      let targetH = Math.round(baseForHiResH * upscale);
       const longEdge = Math.max(targetW, targetH);
       if (longEdge > 2048) {
         const scale = 2048 / longEdge;
         targetW = Math.round(targetW * scale);
         targetH = Math.round(targetH * scale);
       }
-      // 3x3 グリッドを分割抽出して対象セルをハイレゾ再生成する方式
-      // まず対象セルを crop して参照として与える
+  // Split 3x3 grid, crop target cell, and re-generate at higher resolution
+  // First crop the target cell and supply it as a reference
       const cellCanvas = document.createElement('canvas');
-      const cellW = baseW; const cellH = baseH; // 元サイズを想定
+      const cellW = baseForHiResW; const cellH = baseForHiResH;
       cellCanvas.width = cellW; cellCanvas.height = cellH;
       const ctx = cellCanvas.getContext('2d');
-      if (!ctx) throw new Error('Canvas未サポート');
+  if (!ctx) throw new Error('Canvas not supported');
       const gridImg = new Image();
-      gridImg.src = `data:image/png;base64,${poseGridB64}`;
-      await new Promise(res=> { gridImg.onload = () => res(null); });
-      const col = idx % 3; const row = Math.floor(idx/3);
-      ctx.drawImage(gridImg, col*cellW, row*cellH, cellW, cellH, 0,0, cellW, cellH);
+      gridImg.src = `data:image/png;base64,${gridB64}`;
+      await new Promise(res => { gridImg.onload = () => res(null); });
+      const col = idx % 3; const row = Math.floor(idx / 3);
+      ctx.drawImage(gridImg, col * cellW, row * cellH, cellW, cellH, 0, 0, cellW, cellH);
       const cellDataUrl = cellCanvas.toDataURL('image/png');
       const cellB64 = cellDataUrl.split(',')[1];
-      const prompt = `${hiResPosePrompt()}\n${sizeHint(targetW, targetH)}`;
-      const parts: any[] = [
+      const prompt = `${buildHiResPosePrompt()}\n${sizeHint(targetW, targetH)}`;
+      interface InlinePart { inlineData: { mimeType: string; data: string }; }
+      interface TextPart { text: string; }
+      type ContentPart = TextPart | InlinePart;
+      const parts: ContentPart[] = [
         { text: prompt },
-        { inlineData: { mimeType: 'image/png', data: cellB64 } }, // 低解像度セル参照
-        { inlineData: { mimeType: 'image/png', data: resultB64 } } // 元合成(アイデンティティ/服装保持)
+        { inlineData: { mimeType: 'image/png', data: cellB64 } },
+        { inlineData: { mimeType: 'image/png', data: resultB64 } }
       ];
-      const response = await ai!.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: parts
-      });
-      const part = (response.candidates?.[0]?.content?.parts || []).find((p: any) => p.inlineData?.data);
-      if (!part?.inlineData?.data) throw new Error('高画質ポーズ生成失敗');
-      const normalized = await enforceSizeB64Strict(part.inlineData.data, targetW, targetH, 'cover');
+  const response = await callGenAI({ prompt, images: parts.filter(p => 'inlineData' in p).map((p: any) => ({ data: p.inlineData.data, mimeType: p.inlineData.mimeType })) });
+  if (!response.imageB64) throw new Error('High-res pose generation failed');
+  const normalized = await enforceSizeB64Strict(response.imageB64, targetW, targetH, 'cover');
       setHiResPoseB64(normalized);
       setHiResW(targetW); setHiResH(targetH);
     } catch (e) {
@@ -205,79 +312,187 @@ export default function Page() {
     } finally {
       setHiResLoading(false);
     }
-  }, [apiKey, ai, poseGridB64, resultB64, baseW, baseH]);
+  }, [poseGridB64, colorGridB64, resultB64, baseW, baseH, compW, compH]);
 
-  // 表示用縮小寸法計算（実データはフル解像度保持）
-  const displayDims = useMemo(()=>{
-    if(!baseW || !baseH) return null;
-    const MAX_LONG = 480; // 単体表示の長辺上限
-    const scale = Math.min(1, MAX_LONG / Math.max(baseW, baseH));
-    return { w: Math.round(baseW * scale), h: Math.round(baseH * scale), scale };
-  }, [baseW, baseH]);
+  // Display size downscale calculation (full-resolution data retained)
+  const displayDims = useMemo(() => {
+    const w = compW || baseW; const h = compH || baseH;
+    if (!w || !h) return null;
+    const MAX_LONG = 480;
+    const scale = Math.min(1, MAX_LONG / Math.max(w, h));
+    return { w: Math.round(w * scale), h: Math.round(h * scale), scale };
+  }, [baseW, baseH, compW, compH]);
 
-  const gridDisplayDims = useMemo(()=>{
-    if(!baseW || !baseH) return null;
-    const gridW = baseW * 3; const gridH = baseH * 3;
-    const MAX_LONG = 780; // グリッド表示長辺上限
+  // Simplified grid display dims
+  const gridDisplayDims = useMemo(() => {
+    const cellW = compW || baseW; const cellH = compH || baseH;
+    if (!cellW || !cellH) return null;
+    const gridW = cellW * 3; const gridH = cellH * 3;
+    const MAX_LONG = 780;
     const scale = Math.min(1, MAX_LONG / Math.max(gridW, gridH));
-    return { w: Math.round(gridW * scale), h: Math.round(gridH * scale), scale };
-  }, [baseW, baseH]);
+    return { w: Math.round(gridW * scale), h: Math.round(gridH * scale), scale, origW: gridW, origH: gridH };
+  }, [baseW, baseH, compW, compH]);
 
-  // 3x3 カラーグリッド生成
+  // Generate 3x3 color composite grid (person + item → 9 color variants)
   const generateColorGrid = useCallback(async () => {
     try {
       setError("");
-      if (!resultB64) { setError("先に合成画像を生成してください"); return; }
-      if (!baseW || !baseH) { setError("基準サイズ未取得"); return; }
-      if (!apiKey) { setError("APIキー未設定"); return; }
+      if (!personFile) { setError('Upload a person image'); return; }
+      if (!itemFile) { setError('Upload a fashion item image'); return; }
+      if (!baseW || !baseH) { setError('Base size not available'); return; }
+  // key server-side
       setGeneratingColor(true);
-      const colors = PALETTES[paletteId].colors;
-      const parts: any[] = [
-        { text: `${colorGridPrompt(colors, baseW, baseH)}\n${sizeHint(baseW*3, baseH*3)}` },
-        { inlineData: { mimeType: 'image/png', data: resultB64 } }
-      ];
-      if (itemFile) {
-        const itemInline = await toInlineData(itemFile);
-        parts.push(itemInline);
+      setColorProgress(0);
+      // Stage 1: ensure base composite exists (person + original item)
+      if (!resultB64) {
+        await run(); // this sets resultB64 / compW / compH
+        setColorProgress(1); // composite ready
+      } else {
+        setColorProgress(1); // composite already existed
       }
-      const res = await ai!.models.generateContent({ model: 'gemini-2.5-flash-image-preview', contents: parts });
-      const gridPart = (res.candidates?.[0]?.content?.parts || []).find((p: any)=> p.inlineData?.data);
-      if(!gridPart?.inlineData?.data) throw new Error('カラーグリッドが返りませんでした');
-      const rawB64 = gridPart.inlineData.data;
-      const { w: rawW, h: rawH } = await sizeFromB64(rawB64);
-      const colsApprox = Math.round(rawW / baseW);
-      const rowsApprox = Math.round(rawH / baseH);
-      const ok = Math.abs(rawW - baseW*3) <= 2 && Math.abs(rawH - baseH*3) <= 2 && colsApprox === 3 && rowsApprox === 3;
-      if (!ok) {
-        console.warn(`Color grid layout mismatch (expected 3x3). Detected ~${colsApprox}x${rowsApprox} px:${rawW}x${rawH}`);
-        setColorGridB64(rawB64); // 生で表示
-        return;
+      // Stage 2 (new): generate garment binary mask via API if not cached
+      const maskW = compW || baseW; const maskH = compH || baseH;
+      if (!garmentMaskB64) {
+        try {
+          const maskPrompt = buildGarmentMaskPrompt(maskW, maskH) + '\nMODE=garment_binary_mask_from_composite';
+          const compositeInline = { inlineData: { mimeType: 'image/png', data: resultB64 } };
+          const itemInline = itemFile ? await toInlineData(itemFile) : null;
+          const maskRes = await callGenAI({ prompt: maskPrompt, images: [ { data: resultB64, mimeType: 'image/png' }, ...(itemFile ? [ { data: (await toInlineData(itemFile)).inlineData.data!, mimeType: 'image/png' } ] : []) ] });
+          if (!maskRes.imageB64) throw new Error('Mask not returned');
+          const normalizedMask = await enforceSizeB64Strict(maskRes.imageB64, maskW, maskH, 'cover');
+          setGarmentMaskB64(normalizedMask);
+        } catch (err) {
+          console.warn('[mask] generation failed, falling back to mask-less recolor', err);
+        }
       }
-      const normalized = await enforceSizeB64Strict(rawB64, baseW*3, baseH*3, 'cover');
-      setColorGridB64(normalized);
-    } catch(e) {
+      setColorProgress(2); // mask stage complete (or skipped)
+      // Stage 3: single call 3x3 recolor grid from existing composite (garment only recolored) using mask if available
+      const origCellW = compW || baseW; const origCellH = compH || baseH;
+      const TARGET_LONG = 768;
+      const scale = Math.min(1, TARGET_LONG / Math.max(origCellW, origCellH));
+      const cellW = Math.round(origCellW * scale);
+      const cellH = Math.round(origCellH * scale);
+      const gridW = cellW * 3; const gridH = cellH * 3;
+      // Lock reference metrics
+      let origBorder: { r:number; g:number; b:number } | null = null;
+      let origFace: { r:number; g:number; b:number } | null = null;
+      try { origBorder = await sampleBorderRGB(resultB64, origCellW, origCellH); } catch {}
+      try { origFace = await sampleFaceApproxRGB(resultB64, origCellW, origCellH); } catch {}
+      const lockLines: string[] = [];
+      if (origBorder) lockLines.push(`GLOBAL_COLOR_LOCK: BORDER_MEAN_RGB=(${origBorder.r},${origBorder.g},${origBorder.b}) tolerance=2`);
+      if (origFace) lockLines.push(`FACE_COLOR_LOCK: FACE_MEAN_RGB=(${origFace.r},${origFace.g},${origFace.b}) tolerance=3`);
+      lockLines.push('IMMUTABLE_NON_GARMENT: Background, skin, hair, face features, shadows remain pixel-identical (ΔE<2). Garment only recolor.');
+      lockLines.push('METHOD: Segment garment -> hue/value remap garment layer only -> composite over original unchanged pixels (no background repaint).');
+      if (garmentMaskB64) {
+        lockLines.push('MASK_PROVIDED: White region = garment recolor allowed. Black region MUST remain bitwise identical (no hue/brightness/saturation shift). Use strict masked recolor.');
+        lockLines.push('DO NOT modify any black pixel even slightly. No global grading.');
+      } else {
+        lockLines.push('NO_MASK_FALLBACK: Infer garment region internally but still prohibit changes to non-garment pixels.');
+      }
+      const baseColorPrompt = buildColorGridPrompt([
+        '#FF0000','#0055FF','#FFD700','#00B140','#7A00FF','#FF7A00','#000000','#FFFFFF','#808080'
+      ], cellW, cellH);
+      const colorPrompt = [...lockLines, baseColorPrompt, 'MODE=stage2_recolor_from_composite'].join('\n');
+      const compositeInline = { inlineData: { mimeType: 'image/png', data: resultB64 } };
+  type TextPart = { text: string };
+  type ImagePart = { inlineData: { mimeType: string; data: string } };
+  const contentsParts: (TextPart | ImagePart)[] = [ { text: colorPrompt }, compositeInline ];
+      if (garmentMaskB64) contentsParts.push({ inlineData: { mimeType: 'image/png', data: garmentMaskB64 } });
+      // Repeat composite to further anchor non-garment reference
+      contentsParts.push(compositeInline);
+      const withTimeout = async <T,>(p: Promise<T>, ms: number, label: string): Promise<T> => {
+        return await Promise.race([
+          p,
+          new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timeout (${ms}ms)`)), ms))
+        ]) as T;
+      };
+      // Retry up to 3 times if non-garment color drift detected
+      let normalized: string | null = null;
+      const MAX_TRIES = 3;
+      for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+        const attemptPrompt = colorPrompt + `\nATTEMPT=${attempt}` + (attempt>1 ? '\nREINFORCE: Previous attempt drifted non-garment colors – tighten lock.' : '');
+        contentsParts[0] = { text: attemptPrompt }; // replace first text part with attempt-specific prompt
+        const res = await withTimeout(
+          callGenAI({ prompt: attemptPrompt, images: contentsParts.filter(p => 'inlineData' in p).slice(0).map((p: any) => ({ data: p.inlineData.data, mimeType: p.inlineData.mimeType })) }),
+          120000,
+          'Color grid'
+        );
+        if (!res.imageB64) throw new Error('Color grid not returned');
+        const candidate = await enforceSizeB64Strict(res.imageB64, gridW, gridH, 'cover');
+        try {
+          let accept = true;
+          if (origBorder) {
+            const gridBorder = await sampleBorderRGB(candidate, gridW, gridH);
+            const diffBorder = Math.abs(gridBorder.r-origBorder.r) + Math.abs(gridBorder.g-origBorder.g) + Math.abs(gridBorder.b-origBorder.b);
+            if (diffBorder > 6) accept = false; // >2 avg per channel
+          }
+          if (accept && origFace) {
+            // Extract first cell region to approximate face area (assuming consistent placement)
+            const cellCanvas = document.createElement('canvas'); cellCanvas.width = cellW; cellCanvas.height = cellH;
+            const ctx = cellCanvas.getContext('2d');
+            if (ctx) {
+              const img = new Image(); img.src = `data:image/png;base64,${candidate}`;
+              await new Promise(r => { img.onload = () => r(null); });
+              ctx.drawImage(img, 0, 0, cellW, cellH, 0, 0, cellW, cellH);
+              const firstCellB64 = cellCanvas.toDataURL('image/png').split(',')[1];
+              const faceNow = await sampleFaceApproxRGB(firstCellB64, cellW, cellH);
+              const diffFace = Math.abs(faceNow.r-origFace.r) + Math.abs(faceNow.g-origFace.g) + Math.abs(faceNow.b-origFace.b);
+              if (diffFace > 9) accept = false; // >3 avg per channel
+            }
+          }
+          if (accept) { normalized = candidate; break; }
+          if (attempt === MAX_TRIES) {
+            normalized = candidate; console.warn('[color-grid] accepting last attempt with drift');
+          } else {
+            // retry
+          }
+        } catch (e) {
+          // If sampling fails, accept candidate to avoid infinite loop
+          normalized = candidate;
+          break;
+        }
+      }
+      if (!normalized) throw new Error('Color grid generation failed after retries');
+      const { w: gotW, h: gotH } = await sizeFromB64(normalized);
+      const colInt = Math.round(gotW / cellW); const rowInt = Math.round(gotH / cellH);
+      if (!(gotW === gridW && gotH === gridH && colInt === 3 && rowInt === 3)) {
+        throw new Error(`Not 3x3 (${colInt}x${rowInt})`);
+      }
+  setColorGridB64(normalized);
+  setColorProgress(3);
+    } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
     } finally {
       setGeneratingColor(false);
+      setTimeout(() => setColorProgress(0), 800);
     }
-  }, [apiKey, ai, resultB64, baseW, baseH, itemFile, paletteId, toInlineData]);
+  }, [personFile, itemFile, baseW, baseH, compW, compH, run, resultB64, garmentMaskB64, toInlineData]);
 
   return (
     <main className="container fade-in fx-scroll-soft" aria-labelledby="app-title">
       {(state === 'working' || generatingColor || hiResLoading) && (
-        <div className="fx-busy-overlay" role="status" aria-live="assertive" aria-label="生成処理中">
+        <div className="fx-busy-overlay" role="alert" aria-live="assertive" aria-label="Generating images">
           <div className="fx-busy-box">
-            <div className="fx-spinner" aria-hidden="true">
-              <svg viewBox="0 0 50 50">
-                <circle cx="25" cy="25" r="20" />
-              </svg>
-            </div>
-            <div className="fx-busy-title">画像生成中…</div>
-            <div className="fx-busy-progress" aria-hidden="true" />
-            <p className="fx-busy-sub">
-              モデルへのリクエストを処理しています。<br />
-              そのままお待ちください。
+            <div className="fx-busy-title" style={{ marginTop: 4 }}>Generating images…</div>
+            <div
+              className="fx-busy-progress"
+              role="progressbar"
+              aria-valuetext="in progress"
+              aria-label="progress (indeterminate)"
+            />
+            <p className="fx-busy-sub" style={{ marginTop: 10 }}>
+              Processing requests to the model.<br />
+              Please wait.
+              {generatingColor && (
+                <>
+                  <br />
+                  {colorProgress === 0 && 'Stage 1: generating base composite'}
+                  {colorProgress === 1 && 'Stage 2: generating garment binary mask'}
+                  {colorProgress === 2 && 'Stage 3: garment recolor 3x3 grid'}
+                  {colorProgress === 3 && 'Finalizing color grid…'}
+                </>
+              )}
             </p>
           </div>
         </div>
@@ -286,255 +501,69 @@ export default function Page() {
         <div className="title-band-inner">
           <h1 id="app-title" className="app-title">Fashion Fusion <span className="fx-badge" aria-label="preview version">Preview</span></h1>
           <div className="hero-accent" aria-hidden="true" />
-          <p className="subtitle">人物 + ファッションアイテム画像をアップロードし、Universal プロンプトで自然合成と色バリエーション生成を行うミニツール。</p>
+          <p className="subtitle">Upload a person image plus a fashion item image, then generate a natural composite and 3x3 color variation grid using the unified universal prompt pipeline.</p>
         </div>
       </header>
 
-      <div className="upload-grid">
-        <div className="card fx-glow-ring">
-          <div className="card-header">1. 画像アップロード</div>
-          <div className="fx-grid">
-            <div
-              className={`upload-zone ${personFile ? 'has-file' : ''}`}
-              {...buildDropHandlers('person')}
-              aria-label="人物画像を選択 (クリック / ドラッグ&ドロップ)"
-            >
-              {personFile ? (
-                <div className="upload-inner" style={{justifyContent:'center',alignItems:'center',minHeight:168}}>
-                  <strong className="text-secondary" style={{ fontSize: 12 }}>人物画像</strong>
-                  <span className="file-name" title={personFile.name}>{personFile.name}</span>
-                  {(() => {
-                    let w = personW || 0; let h = personH || 0;
-                    const LONG_MAX = 140; const SHORT_MIN = 90;
-                    if (w && h) {
-                      let scale = Math.min(1, LONG_MAX / Math.max(w, h));
-                      if (Math.min(w, h) * scale < SHORT_MIN) {
-                        scale = SHORT_MIN / Math.min(w, h);
-                      }
-                      if (Math.max(w * scale, h * scale) > LONG_MAX) {
-                        const adjust = LONG_MAX / Math.max(w * scale, h * scale);
-                        scale *= adjust;
-                      }
-                      w = Math.round(w * scale); h = Math.round(h * scale);
-                    } else { w = 140; h = 140; }
-                    return (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        alt="人物プレビュー"
-                        className="thumb"
-                        src={URL.createObjectURL(personFile)}
-                        style={{ width: w, height: h, objectFit: 'contain', background: 'var(--fx-surface-alt,transparent)', borderRadius: 6, display:'block', margin:'0 auto', maxWidth:'min(140px,90vw)', maxHeight:'min(140px,40vh)', minWidth:'40px', minHeight:'40px' }}
-                        onLoad={e => URL.revokeObjectURL((e.target as HTMLImageElement).src)}
-                      />
-                    );
-                  })()}
-                  {personW && personH && (
-                    <span style={{fontSize:10, opacity:.7, marginTop:4}}>{personW}×{personH}</span>
-                  )}
-                  <button type="button" className="fx-btn-outline fx-btn fx-btn-tone-plain" style={{ fontSize: 12, padding: '4px 10px' }} onClick={e => { e.stopPropagation(); setPersonFile(null); }}>クリア</button>
-                </div>
-              ) : (
-                <div className="upload-placeholder">
-                  <span className="fx-section-title" style={{ marginBottom: 6 }}>人物画像</span>
-                  <p className="note" style={{ fontSize: 12.5 }}>クリック or ドロップ<br />PNG / JPG / WEBP</p>
-                </div>
-              )}
-              <input
-                ref={personInputRef}
-                type="file"
-                accept="image/*"
-                hidden
-                onChange={e => handleFilePick('person', e.target.files)}
-              />
-            </div>
-
-            <div
-              className={`upload-zone ${itemFile ? 'has-file' : ''}`}
-              {...buildDropHandlers('item')}
-              aria-label="アイテム画像を選択 (クリック / ドラッグ&ドロップ)"
-            >
-              {itemFile ? (
-                <div className="upload-inner">
-                  <strong className="text-secondary" style={{ fontSize: 12 }}>アイテム画像</strong>
-                  <span className="file-name" title={itemFile.name}>{itemFile.name}</span>
-                  {(() => {
-                    let w = itemW || 0; let h = itemH || 0;
-                    const LONG_MAX = 140; const SHORT_MIN = 90;
-                    if (w && h) {
-                      let scale = Math.min(1, LONG_MAX / Math.max(w, h));
-                      if (Math.min(w, h) * scale < SHORT_MIN) {
-                        scale = SHORT_MIN / Math.min(w, h);
-                      }
-                      if (Math.max(w * scale, h * scale) > LONG_MAX) {
-                        const adjust = LONG_MAX / Math.max(w * scale, h * scale);
-                        scale *= adjust;
-                      }
-                      w = Math.round(w * scale); h = Math.round(h * scale);
-                    } else { w = 140; h = 140; }
-                    return (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        alt="アイテムプレビュー"
-                        className="thumb"
-                        src={URL.createObjectURL(itemFile)}
-                        style={{ width: w, height: h, objectFit: 'contain', background: 'var(--fx-surface-alt,transparent)', borderRadius: 6, display:'block', margin:'0 auto', maxWidth:'min(140px,90vw)', maxHeight:'min(140px,40vh)', minWidth:'40px', minHeight:'40px' }}
-                        onLoad={e => URL.revokeObjectURL((e.target as HTMLImageElement).src)}
-                      />
-                    );
-                  })()}
-                  {itemW && itemH && (
-                    <span style={{fontSize:10, opacity:.7, marginTop:4}}>{itemW}×{itemH}</span>
-                  )}
-                  <button type="button" className="fx-btn-outline fx-btn fx-btn-tone-plain" style={{ fontSize: 12, padding: '4px 10px' }} onClick={e => { e.stopPropagation(); setItemFile(null); }}>クリア</button>
-                </div>
-              ) : (
-                <div className="upload-placeholder">
-                  <span className="fx-section-title" style={{ marginBottom: 6 }}>アイテム画像</span>
-                  <p className="note" style={{ fontSize: 12.5 }}>クリック or ドロップ<br />PNG / JPG / WEBP</p>
-                </div>
-              )}
-              <input
-                ref={itemInputRef}
-                type="file"
-                accept="image/*"
-                hidden
-                onChange={e => handleFilePick('item', e.target.files)}
-              />
-            </div>
-          </div>
-        </div>
-      </div>
+      <UploadArea
+        personFile={personFile}
+        itemFile={itemFile}
+        personW={personW} personH={personH} itemW={itemW} itemH={itemH}
+        onPick={handleFilePick}
+        onClear={(k) => k === 'person' ? setPersonFile(null) : setItemFile(null)}
+      />
 
       <div className="fx-divider" />
 
-      <div className="actions-bar">
-        <button className="fx-btn fx-pulse" onClick={run} disabled={state === 'working'}>
-          {state === 'working' ? '合成中…' : '合成する'}
-        </button>
-        {state === 'working' && <span className="chip">生成中</span>}
-        {error && <span className="error-text" role="alert">{error}</span>}
-        {resultB64 && state === 'done' && <span className="chip status-chip-success">Done</span>}
-      </div>
+      <ResultPanel
+        state={state}
+        error={error}
+        resultB64={resultB64}
+        baseW={baseW} baseH={baseH} compW={compW} compH={compH}
+        paletteId={paletteId}
+        onPalette={setPaletteId}
+        onDownloadComposite={() => downloadB64PNG('composite', resultB64, (compW || baseW), (compH || baseH))}
+        onClearComposite={() => setResultB64("")}
+  onGeneratePose={run}
+  onGeneratePoseGrid={generatePoseGrid}
+        onGenerateColor={generateColorGrid}
+        generatingColor={generatingColor}
+        poseGridB64={poseGridB64}
+        colorGridB64={colorGridB64}
+        gridDisplayDims={gridDisplayDims}
+        downloadGrid={(k) => downloadB64PNG(`${k}-grid-3x3`, k === 'pose' ? poseGridB64 : colorGridB64, (compW || baseW) * 3, (compH || baseH) * 3)}
+        clearGrid={(k) => k === 'pose' ? setPoseGridB64("") : setColorGridB64("")}
+  setShowCompositeFull={(v) => { if (v && resultB64) setFullscreen({ kind: 'composite', b64: resultB64 }); else setFullscreen(null); }}
+        displayDims={displayDims}
+  onFullscreen={(kind, b64) => setFullscreen({ kind, b64 })}
+      />
 
-      {resultB64 && (
-        <div className="card fx-glow-ring fade-in section-block">
-          <div className="card-header">
-            <span>結果</span>
-            <span className="chip">1</span>
-          </div>
+      <HighResPanel
+        poseGridB64={poseGridB64}
+        colorGridB64={colorGridB64}
+        source={hiResSource}
+        hiResPoseB64={hiResPoseB64}
+        hiResIndex={hiResIndex}
+        hiResLoading={hiResLoading}
+        hiResW={hiResW} hiResH={hiResH}
+        compW={compW} compH={compH} baseW={baseW} baseH={baseH}
+        onGenerate={(i, src) => { setHiResSourceImmediate(src); generateHighResPose(i); }}
+        onClear={() => setHiResPoseB64("")}
+        download={(label, b64, w, h) => downloadB64PNG(label, b64, w, h)}
+      />
+      {fullscreen && (
+        <div
+          onClick={() => setFullscreen(null)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'zoom-out', padding: '4vh 4vw' }}
+        >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            className="result-img"
-            alt="result"
-            src={`data:image/png;base64,${resultB64}`}
-            style={displayDims ? { width: displayDims.w, height: displayDims.h, objectFit: 'contain', borderRadius: 12, display:'block', margin:'0 auto', maxWidth:'min(480px,96vw)', maxHeight:'min(480px,60vh)' } : {}}
+            src={`data:image/png;base64,${fullscreen.b64}`}
+            alt={`${fullscreen.kind} fullscreen`}
+            style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', boxShadow: '0 0 0 1px rgba(255,255,255,0.15),0 6px 32px -4px rgba(0,0,0,0.6)', borderRadius: 16 }}
           />
-          {displayDims && displayDims.scale < 1 && (
-            <p className="note" style={{marginTop:6,fontSize:11}}>表示縮小 {Math.round(displayDims.scale*100)}% （元 {baseW}×{baseH}）</p>
-          )}
-          <div className="result-actions">
-            <button className="fx-btn-outline fx-btn fx-btn-tone-plain" onClick={()=> downloadB64PNG('composite', resultB64, baseW, baseH)}>保存</button>
-            <button className="fx-btn-outline fx-btn fx-btn-tone-plain" onClick={() => setResultB64("")}>クリア</button>
-            <select aria-label="カラーパレット" className="fx-input palette-select" value={paletteId} disabled={state==='working' || generatingColor} onChange={e=> setPaletteId(e.target.value as PaletteId)}>
-              {Object.entries(PALETTES).map(([id,p]) => <option key={id} value={id}>{p.label}</option>)}
-            </select>
-            <button className="fx-btn-outline fx-btn" disabled={state === 'working' || generatingColor} onClick={generatePoseGrid}>3×3ポーズ生成</button>
-            <button className="fx-btn-outline fx-btn" disabled={state==='working' || generatingColor} onClick={generateColorGrid}>{generatingColor? 'カラー生成中…' : '3×3カラー生成'}</button>
-          </div>
-          <p className="note" style={{ marginTop: 12 }}>生成画像には不可視の SynthID が含まれる場合があります。商用利用前に利用規約を確認してください。</p>
-          {poseGridB64 && (
-            <div className="section-block">
-              <div className="card-header" style={{ marginBottom: 10 }}>ポーズバリエ (3×3)</div>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                className="result-img"
-                alt="pose grid"
-                src={`data:image/png;base64,${poseGridB64}`}
-                style={gridDisplayDims ? { width: gridDisplayDims.w, height: gridDisplayDims.h, objectFit: 'contain', borderRadius: 12, display:'block', margin:'0 auto', maxWidth:'min(780px,98vw)', maxHeight:'min(780px,60vh)' } : {}}
-              />
-              {gridDisplayDims && gridDisplayDims.scale < 1 && (
-                <p className="note" style={{marginTop:6,fontSize:11}}>表示縮小 {Math.round(gridDisplayDims.scale*100)}% （元 {baseW*3}×{baseH*3}）</p>
-              )}
-              <div className="result-actions">
-                <button className="fx-btn-outline fx-btn fx-btn-tone-plain" onClick={()=> downloadB64PNG('pose-grid-3x3', poseGridB64, baseW*3, baseH*3)}>ポーズ保存</button>
-                <button className="fx-btn-outline fx-btn fx-btn-tone-plain" onClick={() => setPoseGridB64("")}>グリッド削除</button>
-              </div>
-              {/* 3×3 セル対応高画質生成ボタン */}
-              <div style={{ marginTop: 16 }}>
-                <div className="card-header" style={{ marginBottom: 8 }}>高画質ポーズ単体生成 (セル選択)</div>
-                <div style={{display:'grid',gridTemplateColumns:'repeat(3,minmax(0,1fr))',gap:8}}>
-                  {Array.from({length:9}).map((_,i)=>{
-                    const disabled = hiResLoading || state==='working';
-                    return (
-                      <button
-                        key={i}
-                        className="fx-btn-outline fx-btn fx-btn-tone-plain"
-                        style={{padding:'6px 4px',fontSize:12,lineHeight:1.2}}
-                        disabled={disabled}
-                        onClick={()=> generateHighResPose(i)}
-                        aria-label={`セル ${i+1} の高画質生成`}
-                      >
-                        {hiResLoading && hiResIndex===i ? '生成中…' : `セル ${i+1}`}
-                      </button>
-                    );
-                  })}
-                </div>
-                <p className="note" style={{marginTop:8,fontSize:11}}>任意のセルを選ぶとそのポーズを高精細化して再生成します (服装・顔は維持)。</p>
-              </div>
-            </div>
-          )}
-          {colorGridB64 && (
-            <div className="section-block">
-              <div className="card-header" style={{ marginBottom: 10 }}>カラー バリエ (3×3)</div>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                className="result-img"
-                alt="color grid"
-                src={`data:image/png;base64,${colorGridB64}`}
-                style={gridDisplayDims ? { width: gridDisplayDims.w, height: gridDisplayDims.h, objectFit: 'contain', borderRadius: 12, display:'block', margin:'0 auto', maxWidth:'min(780px,98vw)', maxHeight:'min(780px,60vh)' } : {}}
-              />
-              {gridDisplayDims && gridDisplayDims.scale < 1 && (
-                <p className="note" style={{marginTop:6,fontSize:11}}>表示縮小 {Math.round(gridDisplayDims.scale*100)}% （元 {baseW*3}×{baseH*3}）</p>
-              )}
-              <div className="result-actions">
-                <button className="fx-btn-outline fx-btn fx-btn-tone-plain" onClick={()=> downloadB64PNG('color-grid-3x3', colorGridB64, baseW*3, baseH*3)}>カラー保存</button>
-                <button className="fx-btn-outline fx-btn fx-btn-tone-plain" onClick={()=> setColorGridB64("")}>グリッド削除</button>
-              </div>
-              <p className="note" style={{marginTop:8,fontSize:11}}>人物・背景は維持し衣装部分のみ色替え。</p>
-            </div>
-          )}
-          {hiResPoseB64 && (
-            <div className="section-block">
-              <div className="card-header" style={{ marginBottom: 10 }}>高画質ポーズ結果 (セル {hiResIndex !== null ? hiResIndex+1 : '-'} )</div>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                className="result-img"
-                alt="high-res pose"
-                src={`data:image/png;base64,${hiResPoseB64}`}
-                style={{
-                  maxWidth: 'min(620px,96vw)',
-                  width: hiResW || baseW,
-                  height: hiResH || baseH,
-                  aspectRatio: `${hiResW || baseW}/${hiResH || baseH}`,
-                  borderRadius: 14,
-                  objectFit: 'contain',
-                  display:'block',
-                  margin:'0 auto',
-                  maxHeight: '60vh'
-                }}
-              />
-              <div className="result-actions">
-                <button className="fx-btn-outline fx-btn fx-btn-tone-plain" onClick={()=> downloadB64PNG(`pose-cell-${(hiResIndex??0)+1}-hires`, hiResPoseB64, hiResW, hiResH)}>保存</button>
-                <button className="fx-btn-outline fx-btn fx-btn-tone-plain" onClick={()=> setHiResPoseB64("")}>クリア</button>
-              </div>
-            </div>
-          )}
         </div>
       )}
-
-      <footer>
-        Model: gemini-2.5-flash-image-preview · Front-end prototype
-      </footer>
     </main>
   );
 }
