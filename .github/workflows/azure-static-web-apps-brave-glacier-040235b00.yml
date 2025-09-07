@@ -22,8 +22,8 @@ jobs:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: "npm"
 
       - name: Install deps
         run: npm ci
@@ -53,4 +53,3 @@ jobs:
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_BRAVE_GLACIER_040235B00 }}
           action: "close"
-
