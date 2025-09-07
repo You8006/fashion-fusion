@@ -154,6 +154,36 @@ export async function POST(req: NextRequest) {
             }
           ]
         };
+        // 送信直前ボディログ (400 Bad Request 切り分け用)
+        try {
+          const full = process.env.LOG_GEMINI_BODY === '1' || req.nextUrl?.searchParams?.get('body') === '1';
+          const sanitize = (body: typeof geminiBody) => {
+            if (full) return body; // フル出力 (画像 Base64 も含む: サイズ大注意)
+            return {
+              contents: body.contents.map(c => ({
+                role: c.role,
+                parts: c.parts.map(p => {
+                  if (typeof p === 'object' && p && 'text' in p && typeof (p as any).text === 'string') {
+                    const textVal = (p as any).text as string;
+                    return { text: textVal.length > 400 ? textVal.slice(0,400) + `...(+${textVal.length-400} chars)` : textVal };
+                  }
+                  if (typeof p === 'object' && p && 'inlineData' in p) {
+                    const inline: any = (p as any).inlineData;
+                    const d = inline?.data as string | undefined;
+                    return {
+                      inlineData: {
+                        mimeType: inline?.mimeType,
+                        data: d ? `<base64 length=${d.length}>` : '<missing>'
+                      }
+                    };
+                  }
+                  return p;
+                })
+              }))
+            };
+          };
+          log({ t: 'upstream_request_body', debug: true, model, full, body: sanitize(geminiBody) });
+        } catch { /* ignore logging errors */ }
         const upstreamStarted = Date.now();
         const upstreamRes = await fetch(GEMINI_URL, {
           method: 'POST',
@@ -182,6 +212,36 @@ export async function POST(req: NextRequest) {
         }
       ]
     };
+    // Upstream 呼び出し前の本番向けサニタイズログ (400 原因特定用)
+    try {
+      const full = process.env.LOG_GEMINI_BODY === '1' || req.nextUrl?.searchParams?.get('body') === '1';
+      const summarize = (body: typeof upstreamBody) => {
+        if (full) return body; // 危険: 画像 Base64 を含むため大量ログ注意
+        return {
+          contents: body.contents.map(c => ({
+            role: c.role,
+            parts: c.parts.map(p => {
+              if (typeof p === 'object' && p && 'text' in p && typeof (p as any).text === 'string') {
+                const txt = (p as any).text as string;
+                return { textPreview: txt.slice(0,160), textLen: txt.length };
+              }
+              if (typeof p === 'object' && p && 'inlineData' in p) {
+                const inline: any = (p as any).inlineData;
+                const d = inline?.data as string | undefined;
+                return {
+                  inlineData: {
+                    mimeType: inline?.mimeType,
+                    base64Len: d?.length || 0
+                  }
+                };
+              }
+              return { kind: 'unknown_part' };
+            })
+          }))
+        };
+      };
+      log({ t: 'upstream_request_body', model, full, body: summarize(upstreamBody) });
+    } catch { /* ignore logging errors */ }
     const started = Date.now();
     log({ t: 'fetch', phase: 'start', memRss: process.memoryUsage().rss, upstreamUrl });
   let upstreamStatus: number | undefined;
