@@ -14,6 +14,7 @@ export interface ResultPanelProps {
   onGeneratePose(): void;
   onGeneratePoseGrid(): void; // 3x3 ポーズグリッド生成用 (新規追加)
   onGenerateColor(): void;
+  generatingPoseGrid: boolean; // 追加: ポーズグリッド生成中
   generatingColor: boolean;
   poseGridB64: string; colorGridB64: string;
   gridDisplayDims: { w: number; h: number; scale: number; origW: number; origH: number } | null;
@@ -25,7 +26,7 @@ export interface ResultPanelProps {
   onFullscreen?(kind: 'poseGrid' | 'colorGrid', b64: string): void;
 }
 
-export const ResultPanel: React.FC<ResultPanelProps> = ({ state, error, resultB64, baseW, baseH, compW, compH, paletteId, onPalette, onDownloadComposite, onClearComposite, onGeneratePose, onGeneratePoseGrid, onGenerateColor, generatingColor, poseGridB64, colorGridB64, gridDisplayDims, downloadGrid, clearGrid, setShowCompositeFull, displayDims, onFullscreen }) => {
+export const ResultPanel: React.FC<ResultPanelProps> = ({ state, error, resultB64, baseW, baseH, compW, compH, paletteId, onPalette, onDownloadComposite, onClearComposite, onGeneratePose, onGeneratePoseGrid, onGenerateColor, generatingPoseGrid, generatingColor, poseGridB64, colorGridB64, gridDisplayDims, downloadGrid, clearGrid, setShowCompositeFull, displayDims, onFullscreen }) => {
   return (
     <>
       <div className="actions-bar" role="group" aria-label="Primary Actions">
@@ -46,7 +47,7 @@ export const ResultPanel: React.FC<ResultPanelProps> = ({ state, error, resultB6
             <select aria-label="Color Palette" className="fx-input palette-select" value={paletteId} disabled={state === 'working' || generatingColor} onChange={e => onPalette(e.target.value as PaletteId)}>
               {Object.entries(PALETTES).map(([id, p]) => <option key={id} value={id}>{p.label}</option>)}
             </select>
-            <button className="btn" data-variant="outline" disabled={state === 'working' || generatingColor} onClick={onGeneratePoseGrid}>Generate 3×3 Poses</button>
+            <button className="btn" data-variant="outline" disabled={state === 'working' || generatingColor || generatingPoseGrid} onClick={onGeneratePoseGrid}>{generatingPoseGrid ? 'Generating Poses…' : 'Generate 3×3 Poses'}</button>
             <button className="btn" data-variant="outline" disabled={state === 'working' || generatingColor} onClick={onGenerateColor}>{generatingColor ? 'Generating Colors…' : 'Generate 3×3 Colors'}</button>
           </div>
           {poseGridB64 && gridDisplayDims && (

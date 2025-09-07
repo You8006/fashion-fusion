@@ -9,7 +9,7 @@ import { HighResPanel } from "./components/HighResPanel";
 import { sizeFromFile, sizeFromB64, enforceSizeB64 as enforceSizeB64Strict, downloadB64PNG, clampLongEdgeSize } from "@/lib/size-utils";
 import { sizeHint } from "@/lib/prompt-size-hint";
 // Legacy prompt helpers removed (now unified via prompt-builders)
-import { buildCompositePrompt, buildColorGridPrompt } from "@/lib/prompt-builders";
+import { buildCompositePrompt, buildColorGridPrompt, buildPoseGridPrompt } from "@/lib/prompt-builders";
 import { callGenAI, callGenAIMultipart } from "@/lib/genai-client";
 import { optimizeImages } from "@/lib/compress-utils";
 
@@ -31,6 +31,7 @@ export default function Page() {
   const [garmentMaskB64, setGarmentMaskB64] = useState(""); // API-generated binary mask (white garment / black non-garment)
   const [generatingColor, setGeneratingColor] = useState(false);
   const [colorProgress, setColorProgress] = useState<number>(0); // 0..9
+  const [generatingPoseGrid, setGeneratingPoseGrid] = useState(false);
   // (Legacy removed) itemColorGridB64 no longer needed; two-call pipeline is: (1) composite, (2) recolor grid
   const [state, setState] = useState<UIState>("idle");
   const [error, setError] = useState("");
@@ -241,9 +242,50 @@ export default function Page() {
   }, [personFile, itemFile, baseW, baseH, compW, compH, resultB64, run]);
 
   // Placeholder (pose grid feature trimmed in this refactor). Keeps UI functional without errors.
-  const generatePoseGrid = useCallback(() => {
-    console.warn('[generatePoseGrid] placeholder: pose grid generation disabled in simplified refactor');
-  }, []);
+  // 3x3 ポーズグリッド生成: 合成済み resultB64 を単一参照画像として使用し、ポーズのみ多様化
+  const generatePoseGrid = useCallback(async () => {
+    try {
+      setError("");
+      if (generatingPoseGrid) return; // 二重起動防止
+      if (!personFile) { setError('Upload a person image'); return; }
+      if (!itemFile) { setError('Upload a fashion item image'); return; }
+      if (!baseW || !baseH) { setError('Base size not available'); return; }
+      setGeneratingPoseGrid(true);
+      // まだ合成がない場合は先に一度実行
+      if (!resultB64) {
+        await run();
+        if (!resultB64) {
+          // run が失敗した場合は state / error に反映済み
+          if (!resultB64) { setGeneratingPoseGrid(false); return; }
+        }
+      }
+      const cellW = compW || baseW; const cellH = compH || baseH;
+      const gridW = cellW * 3; const gridH = cellH * 3;
+      // サイズ上限チェック（color grid と同様簡易判定）
+      const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
+      const totalBytes = base64Bytes(resultB64);
+      const WARN_LIMIT = 3.5 * 1024 * 1024;
+      if (totalBytes > WARN_LIMIT) {
+        setError(`Composite image too large for pose grid request (≈${(totalBytes/1024/1024).toFixed(2)}MB). Resize source images.`);
+        setGeneratingPoseGrid(false);
+        return;
+      }
+      const prompt = buildPoseGridPrompt(cellW, cellH);
+      const res = await callGenAI({ prompt, images: [ { data: (resultB64 || ''), mimeType: 'image/png' } ] });
+      if (!res.imageB64) throw new Error('Pose grid not returned');
+      // 正確サイズ強制
+      const grid = await enforceSizeB64Strict(res.imageB64, gridW, gridH, 'cover');
+      setPoseGridB64(grid);
+    } catch (e) {
+      let msg = e instanceof Error ? e.message : String(e);
+      if (/payload|body|too large|413|4mb/i.test(msg)) {
+        msg = 'Likely payload too large (>4MB). Try smaller or resized images.';
+      }
+      setError(msg);
+    } finally {
+      setGeneratingPoseGrid(false);
+    }
+  }, [personFile, itemFile, baseW, baseH, compW, compH, resultB64, run, generatingPoseGrid]);
 
   // Placeholder high-res (could be re-implemented later)
   const generateHighResPose = useCallback((index: number) => {
@@ -252,7 +294,7 @@ export default function Page() {
 
   return (
     <main className="container fade-in fx-scroll-soft" aria-labelledby="app-title">
-      {(state === 'working' || generatingColor || hiResLoading) && (
+  {(state === 'working' || generatingColor || hiResLoading || generatingPoseGrid) && (
         <div className="fx-busy-overlay" role="alert" aria-live="assertive" aria-label="Generating images">
           <div className="fx-busy-box">
             <div className="fx-busy-title" style={{ marginTop: 4 }}>Generating images…</div>
@@ -272,6 +314,7 @@ export default function Page() {
                   {colorProgress === 1 && 'Stage 2: generating garment binary mask'}
                   {colorProgress === 2 && 'Stage 3: garment recolor 3x3 grid'}
                   {colorProgress === 3 && 'Finalizing color grid…'}
+                  {!generatingColor && generatingPoseGrid && 'Pose 3x3 grid generation'}
                 </>
               )}
             </p>
@@ -307,7 +350,8 @@ export default function Page() {
         onClearComposite={() => setResultB64("")}
   onGeneratePose={run}
   onGeneratePoseGrid={generatePoseGrid}
-        onGenerateColor={generateColorGrid}
+  onGenerateColor={generateColorGrid}
+  generatingPoseGrid={generatingPoseGrid}
         generatingColor={generatingColor}
         poseGridB64={poseGridB64}
         colorGridB64={colorGridB64}
