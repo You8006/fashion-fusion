@@ -17,6 +17,25 @@ export async function POST(req: NextRequest) {
     }
   };
   try {
+    // --- Ultra fast health / return-path diagnostic (?ping=1) ---
+    // 目的: レイテンシ/返却経路/ヘッダー (X-Correlation-Id) を上流要素や画像処理を介さず即確認。
+    // 特徴: API キー未設定でも成功 (鍵チェック前)。Body は一切読み込まない。
+    const ping = req.nextUrl?.searchParams?.get('ping');
+    if (ping === '1') {
+      log({ t: 'ping', stage: 'early', memRss: process.memoryUsage().rss });
+      return new Response(
+        JSON.stringify({
+          pong: true,
+            correlationId: id,
+            now: new Date().toISOString(),
+            uptimeMs: Math.floor(process.uptime() * 1000),
+            node: process.version,
+            memRss: process.memoryUsage().rss
+        }),
+        { status: 200, headers: { 'X-Correlation-Id': id, 'Content-Type': 'application/json' } }
+      );
+    }
+
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       log({ t: 'error', stage: 'config', kind: 'missing_api_key' });
