@@ -45,7 +45,7 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => { URL.revokeObjectURL(url); res(img); };
-    img.onerror = (e) => { URL.revokeObjectURL(url); rej(new Error('Image decode failed')); };
+  img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('Image decode failed')); };
     img.src = url;
   });
 }
@@ -81,7 +81,7 @@ export async function optimizeImages(files: File[], opts: OptimizeOptions): Prom
     let usedScale = 1;
     try {
       const img = await loadImage(file);
-      let w = img.naturalWidth; let h = img.naturalHeight;
+  const w = img.naturalWidth; const h = img.naturalHeight;
       const longEdge = Math.max(w,h);
       let scale = Math.min(1, scaleSuggest, maxLongEdge / longEdge);
       if (scale <= 0) scale = 1;
@@ -107,7 +107,7 @@ export async function optimizeImages(files: File[], opts: OptimizeOptions): Prom
         if (bestBytes <= perFileTarget) break;
       }
       results.push({ original: file, optimized: bestFile, beforeBytes: file.size, afterBytes: bestBytes, downscaled: usedScale < 0.999, qualityUsed: usedQuality, scaleUsed: usedScale });
-    } catch (e) {
+  } catch {
       // Fallback: keep original
       results.push({ original: file, optimized: file, beforeBytes: file.size, afterBytes: file.size, downscaled: false, qualityUsed: 1, scaleUsed: 1 });
     }
