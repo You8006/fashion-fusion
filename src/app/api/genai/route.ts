@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { GoogleGenAI } from '@google/genai';
+// GoogleGenAI SDK を直接使わず raw fetch で upstreamStatus を取得
 import crypto from 'node:crypto';
 
 // Using default (Node) runtime; no explicit export to avoid Turbopack warning.
@@ -150,24 +150,55 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const ai = new GoogleGenAI({ apiKey });
-    const contents = [ { text: prompt }, ...images.map(im => ({ inlineData: { mimeType: im.mimeType || 'image/png', data: im.data } })) ];
+    // --- Upstream (Gemini) 呼び出し: raw fetch で status と本文を完全把握 ---
+    const upstreamUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const upstreamBody = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: prompt },
+            ...images.map(im => ({ inlineData: { mimeType: im.mimeType || 'image/png', data: im.data } }))
+          ]
+        }
+      ]
+    };
     const started = Date.now();
-  log({ t: 'fetch', phase: 'start', memRss: process.memoryUsage().rss });
-    let response;
+    log({ t: 'fetch', phase: 'start', memRss: process.memoryUsage().rss, upstreamUrl });
+    let upstreamStatus: number | undefined;
+    let jsonAny: any = null;
     try {
-      response = await ai.models.generateContent({ model, contents });
+      const upstreamRes = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(upstreamBody)
+      });
+      upstreamStatus = upstreamRes.status;
+      const text = await upstreamRes.text();
+      const bodyLen = text.length;
+      let parsed: any = null;
+      try { parsed = JSON.parse(text); } catch {
+        log({ t: 'error', stage: 'upstream', kind: 'json_parse_fail', upstreamStatus, bodyLen });
+        return new Response(JSON.stringify({ error: 'Upstream JSON parse failed', upstreamStatus, correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
+      }
+      jsonAny = parsed;
+      const durationMs = Date.now() - started;
+      log({ t: 'fetch', phase: 'end', ms: durationMs, upstreamStatus, bodyLen, memRss: process.memoryUsage().rss });
+      if (!upstreamRes.ok) {
+        const snippet = text.slice(0, 300);
+        log({ t: 'error', stage: 'upstream', kind: 'non_200', upstreamStatus, snippetLen: snippet.length });
+        return new Response(JSON.stringify({ error: 'Upstream non-200', upstreamStatus, snippet, correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
+      }
     } catch (err) {
       log({ t: 'error', stage: 'upstream', kind: 'fetch_throw', message: err instanceof Error ? err.message : String(err) });
-      return new Response(JSON.stringify({ error: 'Upstream call failed', correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
+      return new Response(JSON.stringify({ error: 'Upstream call failed', upstreamStatus: upstreamStatus ?? null, correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
     }
     const durationMs = Date.now() - started;
-  log({ t: 'fetch', phase: 'end', ms: durationMs, memRss: process.memoryUsage().rss });
-    const parts = response.candidates?.[0]?.content?.parts || [];
+    const parts = jsonAny?.candidates?.[0]?.content?.parts || [];
     const imgPart = parts.find((p: { inlineData?: { data?: string } }) => p?.inlineData?.data);
     if (!imgPart?.inlineData?.data) {
-      log({ t: 'error', stage: 'response', kind: 'no_image_part' });
-      return new Response(JSON.stringify({ error: 'No image returned', correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
+      log({ t: 'error', stage: 'response', kind: 'no_image_part', upstreamStatus: jsonAny?.promptFeedback?.blockReason || jsonAny?.promptFeedback ? 'ok_no_image' : 'ok' });
+      return new Response(JSON.stringify({ error: 'No image returned', upstreamStatus, correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
     }
     const imageBytes = base64Bytes(imgPart.inlineData.data);
     const wantRaw = req.nextUrl?.searchParams?.get('raw') === '1';
@@ -182,7 +213,7 @@ export async function POST(req: NextRequest) {
     log({ t: 'result', imageBytes, durationMs, memRss: process.memoryUsage().rss });
     const totalMs = Date.now() - startedAll;
     log({ t: 'complete', totalMs, memRss: process.memoryUsage().rss });
-    return new Response(JSON.stringify({ imageB64: imgPart.inlineData.data, meta: { model, durationMs, correlationId: id } }), { status: 200, headers: { 'X-Correlation-Id': id, 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify({ imageB64: imgPart.inlineData.data, meta: { model, durationMs, upstreamStatus: 200, correlationId: id } }), { status: 200, headers: { 'X-Correlation-Id': id, 'Content-Type': 'application/json' } });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
   log({ t: 'error', stage: 'unhandled', kind: 'unexpected', message, memRss: process.memoryUsage().rss });
