@@ -1,8 +1,8 @@
 import type { NextConfig } from "next";
 
-// Azure Static Web Apps Free でのホスティング向けに静的エクスポートを有効化
+// SSR / Route Handlers を有効にするため static export を解除
+// (Azure Static Web Apps で Next.js SSR ランタイムを使用)
 const nextConfig: NextConfig = {
-  output: "export",
   images: { unoptimized: true },
 };
 
