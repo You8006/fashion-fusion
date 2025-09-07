@@ -124,6 +124,15 @@ export default function Page() {
       setState("working");
       const person = await toInlineData(personFile);
       const item = await toInlineData(itemFile);
+      // === Payload size pre-check (Base64 -> bytes ≈ length * 3/4) ===
+      const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
+      const totalBytes = base64Bytes(person.inlineData!.data!) + base64Bytes(item.inlineData!.data!);
+      const WARN_LIMIT = 3.5 * 1024 * 1024; // 3.5MB (approx) safety margin below SWA Functions 4MB
+      if (totalBytes > WARN_LIMIT) {
+        setError(`Payload too large (≈${(totalBytes/1024/1024).toFixed(2)}MB). Please resize images or choose smaller ones (<3.5MB combined).`);
+        setState('idle');
+        return;
+      }
       const prompt = buildCompositePrompt(baseW, baseH);
       const response = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
       if (!response.imageB64) throw new Error('No image returned');
@@ -150,7 +159,11 @@ export default function Page() {
       }
       setState('done');
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e); setError(msg); setState('error');
+      let msg = e instanceof Error ? e.message : String(e);
+      if (/payload|body|too large|413|4mb/i.test(msg)) {
+        msg = 'Likely payload too large (>4MB). Try smaller or resized images.';
+      }
+      setError(msg); setState('error');
     }
   }, [personFile, itemFile, baseW, baseH, toInlineData]);
 
@@ -190,13 +203,26 @@ export default function Page() {
       const prompt = buildColorGridPrompt([
         '#FF0000','#0055FF','#FFD700','#00B140','#7A00FF','#FF7A00','#000000','#FFFFFF','#808080'
       ], cellW, cellH);
+      // Payload size check (single composite image)
+      const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
+      const totalBytes = base64Bytes(resultB64);
+      const WARN_LIMIT = 3.5 * 1024 * 1024;
+      if (totalBytes > WARN_LIMIT) {
+        setError(`Composite image too large for grid request (≈${(totalBytes/1024/1024).toFixed(2)}MB). Resize source images.`);
+        setGeneratingColor(false);
+        return;
+      }
       const res = await callGenAI({ prompt, images: [ { data: (resultB64 || ''), mimeType: 'image/png' } ] });
       if (!res.imageB64) throw new Error('Color grid not returned');
       const grid = await enforceSizeB64Strict(res.imageB64, gridW, gridH, 'cover');
       setColorGridB64(grid);
       setColorProgress(3);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      let msg = e instanceof Error ? e.message : String(e);
+      if (/payload|body|too large|413|4mb/i.test(msg)) {
+        msg = 'Likely payload too large (>4MB). Try smaller or resized images.';
+      }
+      setError(msg);
     } finally {
       setGeneratingColor(false);
       setTimeout(() => setColorProgress(0), 600);

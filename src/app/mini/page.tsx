@@ -56,13 +56,23 @@ export default function MiniPage() {
       setBusy(true);
       const person = await toInline(personFile);
       const item = await toInline(itemFile);
+      // Payload size pre-check
+      const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
+      const totalBytes = base64Bytes(person.inlineData.data!) + base64Bytes(item.inlineData.data!);
+      if (totalBytes > 3.5 * 1024 * 1024) {
+        setError(`Payload too large (≈${(totalBytes/1024/1024).toFixed(2)}MB). Resize images below 3.5MB combined.`);
+        setBusy(false);
+        return;
+      }
       const prompt = buildCompositePrompt(baseW, baseH);
       const res = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
       if (!res.imageB64) throw new Error('No image returned');
       const normalized = await enforceSizeB64Strict(res.imageB64, baseW, baseH, 'cover');
       setResultB64(normalized);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+  let msg = e instanceof Error ? e.message : String(e);
+  if (/payload|body|too large|413|4mb/i.test(msg)) msg = 'Likely payload too large (>4MB). Try smaller or resized images.';
+  setError(msg);
     } finally { setBusy(false); }
   }, [personFile, itemFile, baseW, baseH, toInline]);
 
@@ -77,6 +87,13 @@ export default function MiniPage() {
         '#FF0000','#0055FF','#FFD700','#00B140','#7A00FF','#FF7A00','#000000','#FFFFFF','#808080'
       ], cellW, cellH);
       const itemInline = await toInline(itemFile);
+      const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
+      const totalBytesSingle = base64Bytes(itemInline.inlineData.data!);
+      if (totalBytesSingle > 3.5 * 1024 * 1024) {
+        setError(`Item image too large (≈${(totalBytesSingle/1024/1024).toFixed(2)}MB) for grid request.`);
+        setBusy(false);
+        return;
+      }
       const itemGridRes = await callGenAI({ prompt: itemPrompt, images: [ { data: itemInline.inlineData.data!, mimeType: itemInline.inlineData.mimeType } ] });
       if (!itemGridRes.imageB64) throw new Error('Item color grid failed');
       const itemGridNorm = await enforceSizeB64Strict(itemGridRes.imageB64, cellW * 3, cellH * 3, 'cover');
@@ -94,7 +111,9 @@ export default function MiniPage() {
       const finalGrid = await assembleGridB64(compositeCells, 3, 3, cellW, cellH);
       setColorGridB64(finalGrid);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+  let msg = e instanceof Error ? e.message : String(e);
+  if (/payload|body|too large|413|4mb/i.test(msg)) msg = 'Likely payload too large (>4MB). Try smaller or resized images.';
+  setError(msg);
     } finally { setBusy(false); }
   }, [personFile, itemFile, baseW, baseH, toInline]);
 
