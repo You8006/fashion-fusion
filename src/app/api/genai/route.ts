@@ -170,10 +170,19 @@ export async function POST(req: NextRequest) {
       return new Response(JSON.stringify({ error: 'No image returned', correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
     }
     const imageBytes = base64Bytes(imgPart.inlineData.data);
-  log({ t: 'result', imageBytes, durationMs, memRss: process.memoryUsage().rss });
+    const wantRaw = req.nextUrl?.searchParams?.get('raw') === '1';
+    if (wantRaw) {
+      // 生バイナリ返却モード（デバッグ / 直接表示用途）
+      log({ t: 'result_raw', imageBytes, durationMs, memRss: process.memoryUsage().rss });
+      const buf = Buffer.from(imgPart.inlineData.data, 'base64');
+      const totalMsRaw = Date.now() - startedAll;
+      log({ t: 'complete', totalMs: totalMsRaw, raw: true, memRss: process.memoryUsage().rss });
+      return new Response(buf, { status: 200, headers: { 'Content-Type': 'image/png', 'X-Correlation-Id': id } });
+    }
+    log({ t: 'result', imageBytes, durationMs, memRss: process.memoryUsage().rss });
     const totalMs = Date.now() - startedAll;
-  log({ t: 'complete', totalMs, memRss: process.memoryUsage().rss });
-    return new Response(JSON.stringify({ imageB64: imgPart.inlineData.data, meta: { model, durationMs, correlationId: id } }), { status: 200, headers: { 'X-Correlation-Id': id } });
+    log({ t: 'complete', totalMs, memRss: process.memoryUsage().rss });
+    return new Response(JSON.stringify({ imageB64: imgPart.inlineData.data, meta: { model, durationMs, correlationId: id } }), { status: 200, headers: { 'X-Correlation-Id': id, 'Content-Type': 'application/json' } });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
   log({ t: 'error', stage: 'unhandled', kind: 'unexpected', message, memRss: process.memoryUsage().rss });
