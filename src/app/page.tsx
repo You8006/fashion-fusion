@@ -9,9 +9,9 @@ import { HighResPanel } from "./components/HighResPanel";
 import { sizeFromFile, sizeFromB64, enforceSizeB64 as enforceSizeB64Strict, downloadB64PNG, clampLongEdgeSize } from "@/lib/size-utils";
 import { sizeHint } from "@/lib/prompt-size-hint";
 // Legacy prompt helpers removed (now unified via prompt-builders)
-import { buildCompositePrompt, buildPoseGridPrompt, buildColorGridPrompt, buildHiResPosePrompt } from "@/lib/prompt-builders";
-// Removed direct GoogleGenAI usage on client; now proxied via /api/genai
-import { callGenAI } from "@/lib/genai-client";
+import { buildCompositePrompt } from "@/lib/prompt-builders";
+// 静的エクスポートでは生成 API を呼べないため機能を無効化
+// import { callGenAI } from "@/lib/genai-client";
 
 // Minimal structural type for Gemini image parts to avoid using 'any'
 interface GenAIInlinePart { inlineData?: { data?: string; mimeType?: string } }
@@ -118,43 +118,8 @@ export default function Page() {
   // Removed border/face sampling & drift detection: simplifying to reduce model confusion & global recolor tendencies.
 
   const run = useCallback(async () => {
-    try {
-      setError("");
-      if (!personFile || !itemFile) { setError("Please select both a person image and an item image"); return; }
-      if (!baseW || !baseH) { setError("Failed to get person image size"); return; }
-      setState("working");
-      const person = await toInlineData(personFile);
-      const item = await toInlineData(itemFile);
-      const prompt = buildCompositePrompt(baseW, baseH);
-      const response = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
-      if (!response.imageB64) throw new Error('No image returned');
-      const rawB64 = response.imageB64;
-      let outW = baseW, outH = baseH;
-      try { const { w, h } = await sizeFromB64(rawB64); outW = w; outH = h; } catch (e) { console.warn('[composite] sizeFromB64 failed', e); }
-      const outAspect = outW / outH;
-      const baseAspect = baseW / baseH;
-      const aspectDiff = Math.abs(outAspect - baseAspect);
-      if (aspectDiff <= 0.04) {
-        const normalized = await enforceSizeB64Strict(rawB64, baseW, baseH, 'cover');
-        setResultB64(normalized); setCompW(baseW); setCompH(baseH);
-      } else {
-        // adopt model aspect (downscale if >2048)
-        let finalW = outW, finalH = outH; let finalB64 = rawB64;
-        const longEdge = Math.max(finalW, finalH);
-        if (longEdge > 2048) {
-          const s = 2048 / longEdge; finalW = Math.round(finalW * s); finalH = Math.round(finalH * s);
-          const img = new Image(); img.src = `data:image/png;base64,${rawB64}`;
-          await new Promise(res => { img.onload = () => res(null); });
-          const canvas = document.createElement('canvas'); canvas.width = finalW; canvas.height = finalH;
-          const ctx = canvas.getContext('2d'); if (ctx) { ctx.drawImage(img, 0, 0, finalW, finalH); finalB64 = canvas.toDataURL('image/png').split(',')[1]; }
-        }
-        setResultB64(finalB64); setCompW(finalW); setCompH(finalH);
-      }
-      setState('done');
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e); setError(msg); setState('error');
-    }
-  }, [personFile, itemFile, baseW, baseH, toInlineData]);
+    setError('Image generation disabled in static demo build.');
+  }, []);
 
   // Display size downscale calculation (full-resolution data retained)
   const displayDims = useMemo(() => {
@@ -178,43 +143,8 @@ export default function Page() {
       
   // Simplified color grid generation (two-call pipeline total: composite + color grid)
   const generateColorGrid = useCallback(async () => {
-    try {
-      setError("");
-      if (!personFile) { setError('Upload a person image'); return; }
-      if (!itemFile) { setError('Upload a fashion item image'); return; }
-      if (!baseW || !baseH) { setError('Base size not available'); return; }
-      setGeneratingColor(true);
-      setColorProgress(0);
-      if (!resultB64) { await run(); setColorProgress(1); } else { setColorProgress(1); }
-      const maskW = compW || baseW; const maskH = compH || baseH;
-      // シンプル: 既存 composite を入力に 1 コールで 3x3 カラーバリエーションを直接生成
-      setColorProgress(2); // grid generation stage
-      const cellW = compW || baseW; const cellH = compH || baseH;
-      const gridW = cellW * 3; const gridH = cellH * 3;
-      const oneCallPrompt = [
-        `COLOR_VARIANTS_3x3 size=${gridW}x${gridH} cell=${cellW}x${cellH}`,
-        'Input: composite photo with person wearing fashion items (clothes, jacket, pants, skirt, hat, bag, shoes, accessories).',
-        'Output: ONE PNG 3x3 grid (exact layout) => 9 distinct STYLISH color/style variations of ONLY those fashion items.',
-        'Background, person skin, hair, face, environment, lighting MUST remain pixel-consistent (no filters, no relighting, no global tone shift).',
-        'Allowed changes per cell: base garment/item colors, subtle fabric material hue nuance. Disallow: pose change, anatomy change, added props, text, logos.',
-        'Pick 9 tasteful, diverse fashion colorways yourself (seasonal variety: neutrals, vivid accent, muted, dark, light, warm, cool). Do NOT reuse the identical color twice.',
-        'Each cell must differ clearly. Avoid extreme neon glare or pure black/white duplication. Maintain realistic fabric shading.',
-        'Do NOT alter silhouette or add new garments. Keep stitching & folds consistent; recolor only.',
-        'Return one PNG only (no captions). If transparency is possible for unchanged regions, keep them opaque but unmodified instead.',
-  'Instruction: Do not modify background or the person; only recolor fashion items into 9 stylish distinct variations.'
-      ].join('\n');
-      const res = await callGenAI({ prompt: oneCallPrompt, images: [ { data: resultB64, mimeType: 'image/png' } ] });
-      if (!res.imageB64) throw new Error('Color grid not returned');
-      const grid = await enforceSizeB64Strict(res.imageB64, gridW, gridH, 'cover');
-      setColorGridB64(grid);
-      setColorProgress(3);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setGeneratingColor(false);
-      setTimeout(() => setColorProgress(0), 600);
-    }
-  }, [personFile, itemFile, baseW, baseH, compW, compH, resultB64, run, garmentMaskB64]);
+    setError('Color grid generation disabled in static demo build.');
+  }, []);
 
   // Placeholder (pose grid feature trimmed in this refactor). Keeps UI functional without errors.
   const generatePoseGrid = useCallback(() => {
