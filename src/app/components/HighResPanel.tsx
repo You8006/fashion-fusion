@@ -15,29 +15,8 @@ export interface HighResPanelProps {
   download(label: string, b64: string, w: number, h: number): void;
 }
 
-export const HighResPanel: React.FC<HighResPanelProps> = ({ poseGridB64, colorGridB64, source, hiResPoseB64, hiResIndex, hiResLoading, hiResW, hiResH, compW, compH, baseW, baseH, onGenerate, onClear, download }) => {
-  const gridExists = (src: 'pose' | 'color') => src === 'pose' ? !!poseGridB64 : !!colorGridB64;
-  const cellButtons = (src: 'pose' | 'color') => (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,minmax(0,1fr))', gap: 8 }}>
-      {Array.from({ length: 9 }).map((_, i) => {
-        const disabled = hiResLoading;
-        const activeLoading = hiResLoading && hiResIndex === i && source === src;
-        return (
-          <button
-            key={i}
-            className="btn"
-            data-variant="outline"
-            style={{ padding: '6px 4px', fontSize: 12, lineHeight: 1.2 }}
-            disabled={disabled}
-            onClick={() => onGenerate(i, src)}
-            aria-label={`Generate high-res for ${src === 'pose' ? 'pose' : 'color'} cell ${i + 1}`}
-          >
-            {activeLoading ? 'Processing…' : `Cell ${i + 1}`}
-          </button>
-        );
-      })}
-    </div>
-  );
+export const HighResPanel: React.FC<HighResPanelProps> = ({ /* poseGridB64, colorGridB64, */ source, hiResPoseB64, hiResIndex, hiResLoading, hiResW, hiResH, compW, compH, baseW, baseH, onGenerate, onClear, download }) => {
+  // Selection UI intentionally suppressed (design choice); unused helpers removed to satisfy linter.
 
   return (
     <>
@@ -53,8 +32,8 @@ export const HighResPanel: React.FC<HighResPanelProps> = ({ poseGridB64, colorGr
             style={{ maxWidth: 'min(620px,96vw)', width: hiResW || (compW || baseW), height: hiResH || (compH || baseH), aspectRatio: `${hiResW || (compW || baseW)}/${hiResH || (compH || baseH)}`, borderRadius: 14, objectFit: 'contain', display: 'block', margin: '0 auto', maxHeight: '60vh' }}
           />
           <div className="result-actions" role="group" aria-label="High-Res Actions">
-            <button className="btn" data-variant="outline" onClick={() => download(`pose-cell-${(hiResIndex ?? 0) + 1}-hires`, hiResPoseB64, hiResW, hiResH)}>Download</button>
-            <button className="btn" data-variant="outline" onClick={onClear}>Clear</button>
+            <button className="btn" data-variant="outline" disabled={hiResLoading} onClick={() => download(`cell-${(hiResIndex ?? 0) + 1}-hires`, hiResPoseB64, hiResW, hiResH)}>Download</button>
+            <button className="btn" data-variant="outline" disabled={hiResLoading} onClick={onClear}>Clear</button>
           </div>
         </div>
       )}

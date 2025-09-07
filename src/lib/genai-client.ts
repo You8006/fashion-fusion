@@ -1,6 +1,7 @@
 interface GenAIClientImage { data: string; mimeType?: string }
-interface GenAIClientRequest { prompt: string; images?: GenAIClientImage[]; model?: string }
-interface GenAIClientResponse { imageB64?: string; meta?: any; error?: string }
+export interface GenAIClientRequest { prompt: string; images?: GenAIClientImage[]; model?: string }
+export interface GenAIClientResponseMeta { model?: string; durationMs?: number }
+export interface GenAIClientResponse { imageB64?: string; meta?: GenAIClientResponseMeta; error?: string }
 
 export async function callGenAI(req: GenAIClientRequest, signal?: AbortSignal): Promise<GenAIClientResponse> {
   const res = await fetch('/api/genai', {
@@ -9,10 +10,11 @@ export async function callGenAI(req: GenAIClientRequest, signal?: AbortSignal): 
     body: JSON.stringify(req),
     signal,
   });
-  let json: any = null;
+  let json: unknown = null;
   try { json = await res.json(); } catch { throw new Error('Invalid JSON response'); }
   if (!res.ok) {
-    throw new Error(json?.error || 'GenAI request failed');
+    const errMsg = (json && typeof json === 'object' && 'error' in json) ? (json as { error: string }).error : 'GenAI request failed';
+    throw new Error(errMsg);
   }
   return json as GenAIClientResponse;
 }

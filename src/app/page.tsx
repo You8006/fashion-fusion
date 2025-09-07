@@ -9,7 +9,7 @@ import { HighResPanel } from "./components/HighResPanel";
 import { sizeFromFile, sizeFromB64, enforceSizeB64 as enforceSizeB64Strict, downloadB64PNG, clampLongEdgeSize } from "@/lib/size-utils";
 import { sizeHint } from "@/lib/prompt-size-hint";
 // Legacy prompt helpers removed (now unified via prompt-builders)
-import { buildCompositePrompt, buildPoseGridPrompt, buildColorGridPrompt, buildHiResPosePrompt, buildGarmentMaskPrompt } from "@/lib/prompt-builders";
+import { buildCompositePrompt, buildPoseGridPrompt, buildColorGridPrompt, buildHiResPosePrompt } from "@/lib/prompt-builders";
 // Removed direct GoogleGenAI usage on client; now proxied via /api/genai
 import { callGenAI } from "@/lib/genai-client";
 
@@ -115,204 +115,46 @@ export default function Page() {
   }, []);
 
   // === Sampling utilities (非衣服領域の色保持) ===
-  async function sampleBorderRGB(b64: string, w: number, h: number): Promise<{ r:number; g:number; b:number }> {
-    return await new Promise((resolve, reject) => {
-      try {
-        const img = new Image();
-        img.onload = () => {
-          try {
-            const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
-            const ctx = canvas.getContext('2d'); if (!ctx) return reject(new Error('Canvas 2D unavailable'));
-            ctx.drawImage(img, 0, 0, w, h);
-            const strip = Math.max(4, Math.round(Math.min(w, h) * 0.02));
-            const data = ctx.getImageData(0, 0, w, h).data;
-            let sr=0,sg=0,sb=0,cnt=0;
-            const push=(x:number,y:number)=>{const i=(y*w+x)*4; sr+=data[i]; sg+=data[i+1]; sb+=data[i+2]; cnt++;};
-            for (let x=0;x<w;x++){for(let y=0;y<strip;y++)push(x,y);for(let y=h-strip;y<h;y++)push(x,y);} 
-            for (let y=strip;y<h-strip;y++){for(let x=0;x<strip;x++)push(x,y);for(let x=w-strip;x<w;x++)push(x,y);} 
-            resolve({ r:Math.round(sr/cnt), g:Math.round(sg/cnt), b:Math.round(sb/cnt) });
-          } catch(err){ reject(err instanceof Error?err:new Error('Border sampling failed')); }
-        };
-        img.onerror=()=>reject(new Error('Image decode failed'));
-        img.src=`data:image/png;base64,${b64}`;
-      } catch(e){ reject(e instanceof Error?e:new Error('Border sampling error')); }
-    });
-  }
-
-  async function sampleFaceApproxRGB(b64: string, w: number, h: number): Promise<{ r:number; g:number; b:number }> {
-    return await new Promise((resolve, reject) => {
-      try {
-        const img = new Image();
-        img.onload = () => {
-          try {
-            const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
-            const ctx = canvas.getContext('2d'); if (!ctx) return reject(new Error('Canvas 2D unavailable'));
-            ctx.drawImage(img,0,0,w,h);
-            const fx=Math.round(w*0.3), fw=Math.round(w*0.4); const fy=Math.round(h*0.08), fh=Math.round(h*0.22);
-            const data=ctx.getImageData(fx,fy,fw,fh).data; let sr=0,sg=0,sb=0; const len=data.length/4; for(let i=0;i<data.length;i+=4){sr+=data[i];sg+=data[i+1];sb+=data[i+2];}
-            resolve({ r:Math.round(sr/len), g:Math.round(sg/len), b:Math.round(sb/len)});
-          } catch(err){ reject(err instanceof Error?err:new Error('Face sampling failed')); }
-        };
-        img.onerror=()=>reject(new Error('Image decode failed'));
-        img.src=`data:image/png;base64,${b64}`;
-      } catch(e){ reject(e instanceof Error?e:new Error('Face sampling error')); }
-    });
-  }
+  // Removed border/face sampling & drift detection: simplifying to reduce model confusion & global recolor tendencies.
 
   const run = useCallback(async () => {
     try {
       setError("");
-  // APIキーはサーバ側。ここでは不要。
-  if (!personFile || !itemFile) { setError("Please select both a person image and an item image"); return; }
-  if (!baseW || !baseH) { setError("Failed to get person image size"); return; }
+      if (!personFile || !itemFile) { setError("Please select both a person image and an item image"); return; }
+      if (!baseW || !baseH) { setError("Failed to get person image size"); return; }
       setState("working");
       const person = await toInlineData(personFile);
       const item = await toInlineData(itemFile);
-  // Single attempt
       const prompt = buildCompositePrompt(baseW, baseH);
-  const response = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
-  if (!response.imageB64) throw new Error('No image returned');
-  const rawB64 = response.imageB64;
-  // Obtain model output size
+      const response = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
+      if (!response.imageB64) throw new Error('No image returned');
+      const rawB64 = response.imageB64;
       let outW = baseW, outH = baseH;
-      try {
-        const { w, h } = await sizeFromB64(rawB64);
-        outW = w; outH = h;
-      } catch (e) {
-        console.warn('[composite] sizeFromB64 failed, using base size', e);
-      }
+      try { const { w, h } = await sizeFromB64(rawB64); outW = w; outH = h; } catch (e) { console.warn('[composite] sizeFromB64 failed', e); }
       const outAspect = outW / outH;
       const baseAspect = baseW / baseH;
       const aspectDiff = Math.abs(outAspect - baseAspect);
       if (aspectDiff <= 0.04) {
-  // Close aspect ratio → normalize to base size
         const normalized = await enforceSizeB64Strict(rawB64, baseW, baseH, 'cover');
-        setResultB64(normalized);
-        setCompW(baseW); setCompH(baseH);
+        setResultB64(normalized); setCompW(baseW); setCompH(baseH);
       } else {
-  // Divergent → adopt model output aspect (scale down if >2048)
-        let finalW = outW, finalH = outH;
+        // adopt model aspect (downscale if >2048)
+        let finalW = outW, finalH = outH; let finalB64 = rawB64;
         const longEdge = Math.max(finalW, finalH);
-        let finalB64 = rawB64;
         if (longEdge > 2048) {
-          const s = 2048 / longEdge;
-          finalW = Math.round(finalW * s);
-          finalH = Math.round(finalH * s);
-          const img = new Image();
-          img.src = `data:image/png;base64,${rawB64}`;
+          const s = 2048 / longEdge; finalW = Math.round(finalW * s); finalH = Math.round(finalH * s);
+          const img = new Image(); img.src = `data:image/png;base64,${rawB64}`;
           await new Promise(res => { img.onload = () => res(null); });
-          const canvas = document.createElement('canvas');
-          canvas.width = finalW; canvas.height = finalH;
-          const ctx = canvas.getContext('2d');
-          if (ctx) {
-            ctx.drawImage(img, 0, 0, finalW, finalH);
-            finalB64 = canvas.toDataURL('image/png').split(',')[1];
-          }
+          const canvas = document.createElement('canvas'); canvas.width = finalW; canvas.height = finalH;
+          const ctx = canvas.getContext('2d'); if (ctx) { ctx.drawImage(img, 0, 0, finalW, finalH); finalB64 = canvas.toDataURL('image/png').split(',')[1]; }
         }
-        setResultB64(finalB64);
-        setCompW(finalW); setCompH(finalH);
-        console.warn('[composite] adopt model aspect', { outW, outH, baseW, baseH });
+        setResultB64(finalB64); setCompW(finalW); setCompH(finalH);
       }
       setState('done');
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
-      setState('error');
+      const msg = e instanceof Error ? e.message : String(e); setError(msg); setState('error');
     }
-  }, [personFile, itemFile, toInlineData, baseW, baseH]);
-
-  const generatePoseGrid = useCallback(async () => {
-    try {
-      setError("");
-      if (!resultB64) { setError('Generate a composite first'); return; }
-      if (!baseW || !baseH) { setError('Base size not available'); return; }
-  // key handled server-side
-      setState('working');
-      const cellW = compW || baseW; const cellH = compH || baseH;
-      const gridW = cellW * 3; const gridH = cellH * 3;
-      const posePrompt = buildPoseGridPrompt(cellW, cellH) + '\nMODE=pose_variations_from_composite';
-      interface InlinePart { inlineData: { mimeType: string; data: string } }
-      interface TextPart { text: string }
-      type ContentPart = InlinePart | TextPart;
-      // Use the already generated composite as the single reference image
-      const compositeInline: InlinePart = { inlineData: { mimeType: 'image/png', data: resultB64 } };
-      const parts: ContentPart[] = [ { text: posePrompt }, compositeInline ];
-  const res = await callGenAI({ prompt: posePrompt, images: [ { data: resultB64, mimeType: 'image/png' } ] });
-  if (!res.imageB64) throw new Error('Pose grid not returned');
-  const raw = res.imageB64;
-      const normalized = await enforceSizeB64Strict(raw, gridW, gridH, 'cover');
-      const { w: gotW, h: gotH } = await sizeFromB64(normalized);
-      const colInt = Math.round(gotW / cellW); const rowInt = Math.round(gotH / cellH);
-      if (!(gotW === gridW && gotH === gridH && colInt === 3 && rowInt === 3)) {
-        throw new Error(`Not 3x3 (${colInt}x${rowInt})`);
-      }
-      setPoseGridB64(normalized);
-      setState('done');
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg); setState('error');
-    }
-  }, [resultB64, baseW, baseH, compW, compH]);
-
-  // High-res single-cell variation generation (specified index / palette color)
-  const generateHighResPose = useCallback(async (idx: number) => {
-    try {
-      setError("");
-  // server will hold key
-  // Which grid to crop from (use latest selection via ref)
-      const source = hiResSourceRef.current;
-      const gridB64 = source === 'pose' ? poseGridB64 : colorGridB64;
-  if (!gridB64) { setError(source === 'pose' ? "No pose grid" : "No color grid"); return; }
-  if (!baseW || !baseH) { setError("Base size not available"); return; }
-  if (idx < 0 || idx > 8) { setError("Invalid index"); return; }
-      setHiResLoading(true);
-      setHiResPoseB64("");
-      setHiResIndex(idx);
-      const baseForHiResW = compW || baseW;
-      const baseForHiResH = compH || baseH;
-      const upscale = (Math.max(baseForHiResW, baseForHiResH) >= 1100) ? 1.25 : 2;
-      let targetW = Math.round(baseForHiResW * upscale);
-      let targetH = Math.round(baseForHiResH * upscale);
-      const longEdge = Math.max(targetW, targetH);
-      if (longEdge > 2048) {
-        const scale = 2048 / longEdge;
-        targetW = Math.round(targetW * scale);
-        targetH = Math.round(targetH * scale);
-      }
-  // Split 3x3 grid, crop target cell, and re-generate at higher resolution
-  // First crop the target cell and supply it as a reference
-      const cellCanvas = document.createElement('canvas');
-      const cellW = baseForHiResW; const cellH = baseForHiResH;
-      cellCanvas.width = cellW; cellCanvas.height = cellH;
-      const ctx = cellCanvas.getContext('2d');
-  if (!ctx) throw new Error('Canvas not supported');
-      const gridImg = new Image();
-      gridImg.src = `data:image/png;base64,${gridB64}`;
-      await new Promise(res => { gridImg.onload = () => res(null); });
-      const col = idx % 3; const row = Math.floor(idx / 3);
-      ctx.drawImage(gridImg, col * cellW, row * cellH, cellW, cellH, 0, 0, cellW, cellH);
-      const cellDataUrl = cellCanvas.toDataURL('image/png');
-      const cellB64 = cellDataUrl.split(',')[1];
-      const prompt = `${buildHiResPosePrompt()}\n${sizeHint(targetW, targetH)}`;
-      interface InlinePart { inlineData: { mimeType: string; data: string }; }
-      interface TextPart { text: string; }
-      type ContentPart = TextPart | InlinePart;
-      const parts: ContentPart[] = [
-        { text: prompt },
-        { inlineData: { mimeType: 'image/png', data: cellB64 } },
-        { inlineData: { mimeType: 'image/png', data: resultB64 } }
-      ];
-  const response = await callGenAI({ prompt, images: parts.filter(p => 'inlineData' in p).map((p: any) => ({ data: p.inlineData.data, mimeType: p.inlineData.mimeType })) });
-  if (!response.imageB64) throw new Error('High-res pose generation failed');
-  const normalized = await enforceSizeB64Strict(response.imageB64, targetW, targetH, 'cover');
-      setHiResPoseB64(normalized);
-      setHiResW(targetW); setHiResH(targetH);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setHiResLoading(false);
-    }
-  }, [poseGridB64, colorGridB64, resultB64, baseW, baseH, compW, compH]);
+  }, [personFile, itemFile, baseW, baseH, toInlineData]);
 
   // Display size downscale calculation (full-resolution data retained)
   const displayDims = useMemo(() => {
@@ -333,141 +175,56 @@ export default function Page() {
     return { w: Math.round(gridW * scale), h: Math.round(gridH * scale), scale, origW: gridW, origH: gridH };
   }, [baseW, baseH, compW, compH]);
 
-  // Generate 3x3 color composite grid (person + item → 9 color variants)
+      
+  // Simplified color grid generation (two-call pipeline total: composite + color grid)
   const generateColorGrid = useCallback(async () => {
     try {
       setError("");
       if (!personFile) { setError('Upload a person image'); return; }
       if (!itemFile) { setError('Upload a fashion item image'); return; }
       if (!baseW || !baseH) { setError('Base size not available'); return; }
-  // key server-side
       setGeneratingColor(true);
       setColorProgress(0);
-      // Stage 1: ensure base composite exists (person + original item)
-      if (!resultB64) {
-        await run(); // this sets resultB64 / compW / compH
-        setColorProgress(1); // composite ready
-      } else {
-        setColorProgress(1); // composite already existed
-      }
-      // Stage 2 (new): generate garment binary mask via API if not cached
+      if (!resultB64) { await run(); setColorProgress(1); } else { setColorProgress(1); }
       const maskW = compW || baseW; const maskH = compH || baseH;
-      if (!garmentMaskB64) {
-        try {
-          const maskPrompt = buildGarmentMaskPrompt(maskW, maskH) + '\nMODE=garment_binary_mask_from_composite';
-          const compositeInline = { inlineData: { mimeType: 'image/png', data: resultB64 } };
-          const itemInline = itemFile ? await toInlineData(itemFile) : null;
-          const maskRes = await callGenAI({ prompt: maskPrompt, images: [ { data: resultB64, mimeType: 'image/png' }, ...(itemFile ? [ { data: (await toInlineData(itemFile)).inlineData.data!, mimeType: 'image/png' } ] : []) ] });
-          if (!maskRes.imageB64) throw new Error('Mask not returned');
-          const normalizedMask = await enforceSizeB64Strict(maskRes.imageB64, maskW, maskH, 'cover');
-          setGarmentMaskB64(normalizedMask);
-        } catch (err) {
-          console.warn('[mask] generation failed, falling back to mask-less recolor', err);
-        }
-      }
-      setColorProgress(2); // mask stage complete (or skipped)
-      // Stage 3: single call 3x3 recolor grid from existing composite (garment only recolored) using mask if available
-      const origCellW = compW || baseW; const origCellH = compH || baseH;
-      const TARGET_LONG = 768;
-      const scale = Math.min(1, TARGET_LONG / Math.max(origCellW, origCellH));
-      const cellW = Math.round(origCellW * scale);
-      const cellH = Math.round(origCellH * scale);
+      // シンプル: 既存 composite を入力に 1 コールで 3x3 カラーバリエーションを直接生成
+      setColorProgress(2); // grid generation stage
+      const cellW = compW || baseW; const cellH = compH || baseH;
       const gridW = cellW * 3; const gridH = cellH * 3;
-      // Lock reference metrics
-      let origBorder: { r:number; g:number; b:number } | null = null;
-      let origFace: { r:number; g:number; b:number } | null = null;
-      try { origBorder = await sampleBorderRGB(resultB64, origCellW, origCellH); } catch {}
-      try { origFace = await sampleFaceApproxRGB(resultB64, origCellW, origCellH); } catch {}
-      const lockLines: string[] = [];
-      if (origBorder) lockLines.push(`GLOBAL_COLOR_LOCK: BORDER_MEAN_RGB=(${origBorder.r},${origBorder.g},${origBorder.b}) tolerance=2`);
-      if (origFace) lockLines.push(`FACE_COLOR_LOCK: FACE_MEAN_RGB=(${origFace.r},${origFace.g},${origFace.b}) tolerance=3`);
-      lockLines.push('IMMUTABLE_NON_GARMENT: Background, skin, hair, face features, shadows remain pixel-identical (ΔE<2). Garment only recolor.');
-      lockLines.push('METHOD: Segment garment -> hue/value remap garment layer only -> composite over original unchanged pixels (no background repaint).');
-      if (garmentMaskB64) {
-        lockLines.push('MASK_PROVIDED: White region = garment recolor allowed. Black region MUST remain bitwise identical (no hue/brightness/saturation shift). Use strict masked recolor.');
-        lockLines.push('DO NOT modify any black pixel even slightly. No global grading.');
-      } else {
-        lockLines.push('NO_MASK_FALLBACK: Infer garment region internally but still prohibit changes to non-garment pixels.');
-      }
-      const baseColorPrompt = buildColorGridPrompt([
-        '#FF0000','#0055FF','#FFD700','#00B140','#7A00FF','#FF7A00','#000000','#FFFFFF','#808080'
-      ], cellW, cellH);
-      const colorPrompt = [...lockLines, baseColorPrompt, 'MODE=stage2_recolor_from_composite'].join('\n');
-      const compositeInline = { inlineData: { mimeType: 'image/png', data: resultB64 } };
-  type TextPart = { text: string };
-  type ImagePart = { inlineData: { mimeType: string; data: string } };
-  const contentsParts: (TextPart | ImagePart)[] = [ { text: colorPrompt }, compositeInline ];
-      if (garmentMaskB64) contentsParts.push({ inlineData: { mimeType: 'image/png', data: garmentMaskB64 } });
-      // Repeat composite to further anchor non-garment reference
-      contentsParts.push(compositeInline);
-      const withTimeout = async <T,>(p: Promise<T>, ms: number, label: string): Promise<T> => {
-        return await Promise.race([
-          p,
-          new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timeout (${ms}ms)`)), ms))
-        ]) as T;
-      };
-      // Retry up to 3 times if non-garment color drift detected
-      let normalized: string | null = null;
-      const MAX_TRIES = 3;
-      for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-        const attemptPrompt = colorPrompt + `\nATTEMPT=${attempt}` + (attempt>1 ? '\nREINFORCE: Previous attempt drifted non-garment colors – tighten lock.' : '');
-        contentsParts[0] = { text: attemptPrompt }; // replace first text part with attempt-specific prompt
-        const res = await withTimeout(
-          callGenAI({ prompt: attemptPrompt, images: contentsParts.filter(p => 'inlineData' in p).slice(0).map((p: any) => ({ data: p.inlineData.data, mimeType: p.inlineData.mimeType })) }),
-          120000,
-          'Color grid'
-        );
-        if (!res.imageB64) throw new Error('Color grid not returned');
-        const candidate = await enforceSizeB64Strict(res.imageB64, gridW, gridH, 'cover');
-        try {
-          let accept = true;
-          if (origBorder) {
-            const gridBorder = await sampleBorderRGB(candidate, gridW, gridH);
-            const diffBorder = Math.abs(gridBorder.r-origBorder.r) + Math.abs(gridBorder.g-origBorder.g) + Math.abs(gridBorder.b-origBorder.b);
-            if (diffBorder > 6) accept = false; // >2 avg per channel
-          }
-          if (accept && origFace) {
-            // Extract first cell region to approximate face area (assuming consistent placement)
-            const cellCanvas = document.createElement('canvas'); cellCanvas.width = cellW; cellCanvas.height = cellH;
-            const ctx = cellCanvas.getContext('2d');
-            if (ctx) {
-              const img = new Image(); img.src = `data:image/png;base64,${candidate}`;
-              await new Promise(r => { img.onload = () => r(null); });
-              ctx.drawImage(img, 0, 0, cellW, cellH, 0, 0, cellW, cellH);
-              const firstCellB64 = cellCanvas.toDataURL('image/png').split(',')[1];
-              const faceNow = await sampleFaceApproxRGB(firstCellB64, cellW, cellH);
-              const diffFace = Math.abs(faceNow.r-origFace.r) + Math.abs(faceNow.g-origFace.g) + Math.abs(faceNow.b-origFace.b);
-              if (diffFace > 9) accept = false; // >3 avg per channel
-            }
-          }
-          if (accept) { normalized = candidate; break; }
-          if (attempt === MAX_TRIES) {
-            normalized = candidate; console.warn('[color-grid] accepting last attempt with drift');
-          } else {
-            // retry
-          }
-        } catch (e) {
-          // If sampling fails, accept candidate to avoid infinite loop
-          normalized = candidate;
-          break;
-        }
-      }
-      if (!normalized) throw new Error('Color grid generation failed after retries');
-      const { w: gotW, h: gotH } = await sizeFromB64(normalized);
-      const colInt = Math.round(gotW / cellW); const rowInt = Math.round(gotH / cellH);
-      if (!(gotW === gridW && gotH === gridH && colInt === 3 && rowInt === 3)) {
-        throw new Error(`Not 3x3 (${colInt}x${rowInt})`);
-      }
-  setColorGridB64(normalized);
-  setColorProgress(3);
+      const oneCallPrompt = [
+        `COLOR_VARIANTS_3x3 size=${gridW}x${gridH} cell=${cellW}x${cellH}`,
+        'Input: composite photo with person wearing fashion items (clothes, jacket, pants, skirt, hat, bag, shoes, accessories).',
+        'Output: ONE PNG 3x3 grid (exact layout) => 9 distinct STYLISH color/style variations of ONLY those fashion items.',
+        'Background, person skin, hair, face, environment, lighting MUST remain pixel-consistent (no filters, no relighting, no global tone shift).',
+        'Allowed changes per cell: base garment/item colors, subtle fabric material hue nuance. Disallow: pose change, anatomy change, added props, text, logos.',
+        'Pick 9 tasteful, diverse fashion colorways yourself (seasonal variety: neutrals, vivid accent, muted, dark, light, warm, cool). Do NOT reuse the identical color twice.',
+        'Each cell must differ clearly. Avoid extreme neon glare or pure black/white duplication. Maintain realistic fabric shading.',
+        'Do NOT alter silhouette or add new garments. Keep stitching & folds consistent; recolor only.',
+        'Return one PNG only (no captions). If transparency is possible for unchanged regions, keep them opaque but unmodified instead.',
+  'Instruction: Do not modify background or the person; only recolor fashion items into 9 stylish distinct variations.'
+      ].join('\n');
+      const res = await callGenAI({ prompt: oneCallPrompt, images: [ { data: resultB64, mimeType: 'image/png' } ] });
+      if (!res.imageB64) throw new Error('Color grid not returned');
+      const grid = await enforceSizeB64Strict(res.imageB64, gridW, gridH, 'cover');
+      setColorGridB64(grid);
+      setColorProgress(3);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setGeneratingColor(false);
-      setTimeout(() => setColorProgress(0), 800);
+      setTimeout(() => setColorProgress(0), 600);
     }
-  }, [personFile, itemFile, baseW, baseH, compW, compH, run, resultB64, garmentMaskB64, toInlineData]);
+  }, [personFile, itemFile, baseW, baseH, compW, compH, resultB64, run, garmentMaskB64]);
+
+  // Placeholder (pose grid feature trimmed in this refactor). Keeps UI functional without errors.
+  const generatePoseGrid = useCallback(() => {
+    console.warn('[generatePoseGrid] placeholder: pose grid generation disabled in simplified refactor');
+  }, []);
+
+  // Placeholder high-res (could be re-implemented later)
+  const generateHighResPose = useCallback((index: number) => {
+    console.warn('[generateHighResPose] placeholder: high-res pose generation disabled', index);
+  }, []);
 
   return (
     <main className="container fade-in fx-scroll-soft" aria-labelledby="app-title">
