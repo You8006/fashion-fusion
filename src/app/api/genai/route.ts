@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
     let images: IncomingImage[] = [];
     let rawBytesTotal = 0; // multipart raw bytes (sum of file.size)
 
-    if (contentType.includes('multipart/form-data')) {
+  if (contentType.includes('multipart/form-data')) {
       // Multipart: FormData 経由 (推奨ルート)
       let form: FormData;
       try { form = await req.formData(); } catch {
@@ -51,11 +51,13 @@ export async function POST(req: NextRequest) {
       for (const f of files) {
         if (f instanceof File) {
           const size = f.size;
-            rawBytesTotal += size;
-            // Convert to base64 (Gemini SDK expects inlineData base64)
-            const ab = await f.arrayBuffer();
-            const b64 = Buffer.from(ab).toString('base64');
-            images.push({ data: b64, mimeType: f.type || 'image/png' });
+          rawBytesTotal += size;
+          const encStart = Date.now();
+          const ab = await f.arrayBuffer();
+          const b64 = Buffer.from(ab).toString('base64');
+          const encMs = Date.now() - encStart;
+          images.push({ data: b64, mimeType: f.type || 'image/png' });
+          log({ t: 'encode', fileName: f.name, fileBytes: size, b64Len: b64.length, ms: encMs });
         }
       }
       log({ t: 'multipart', imagesFiles: files.length, accepted: images.length, rawBytesTotal });
@@ -114,7 +116,11 @@ export async function POST(req: NextRequest) {
     log({ t: 'request', images: images.length, totalImageBytes, model, promptPreview: prompt.slice(0, 160), multipart: contentType.includes('multipart/form-data') });
 
     // --- Debug pass-through mode (raw Gemini API) ---
-    const debugMode = req.nextUrl?.searchParams?.get('debug') === '1' || req.headers.get('x-debug-upstream') === '1';
+    const allowDebug = process.env.DEBUG_UPSTREAM === '1';
+    const debugMode = allowDebug && (req.nextUrl?.searchParams?.get('debug') === '1' || req.headers.get('x-debug-upstream') === '1');
+    if (!allowDebug && (req.nextUrl?.searchParams?.get('debug') === '1')) {
+      log({ t: 'debug_blocked' });
+    }
     if (debugMode) {
       try {
         const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
@@ -147,7 +153,7 @@ export async function POST(req: NextRequest) {
     const ai = new GoogleGenAI({ apiKey });
     const contents = [ { text: prompt }, ...images.map(im => ({ inlineData: { mimeType: im.mimeType || 'image/png', data: im.data } })) ];
     const started = Date.now();
-    log({ t: 'fetch', phase: 'start' });
+  log({ t: 'fetch', phase: 'start', memRss: process.memoryUsage().rss });
     let response;
     try {
       response = await ai.models.generateContent({ model, contents });
@@ -156,7 +162,7 @@ export async function POST(req: NextRequest) {
       return new Response(JSON.stringify({ error: 'Upstream call failed', correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
     }
     const durationMs = Date.now() - started;
-    log({ t: 'fetch', phase: 'end', ms: durationMs });
+  log({ t: 'fetch', phase: 'end', ms: durationMs, memRss: process.memoryUsage().rss });
     const parts = response.candidates?.[0]?.content?.parts || [];
     const imgPart = parts.find((p: { inlineData?: { data?: string } }) => p?.inlineData?.data);
     if (!imgPart?.inlineData?.data) {
@@ -164,13 +170,13 @@ export async function POST(req: NextRequest) {
       return new Response(JSON.stringify({ error: 'No image returned', correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
     }
     const imageBytes = base64Bytes(imgPart.inlineData.data);
-    log({ t: 'result', imageBytes, durationMs });
+  log({ t: 'result', imageBytes, durationMs, memRss: process.memoryUsage().rss });
     const totalMs = Date.now() - startedAll;
-    log({ t: 'complete', totalMs });
+  log({ t: 'complete', totalMs, memRss: process.memoryUsage().rss });
     return new Response(JSON.stringify({ imageB64: imgPart.inlineData.data, meta: { model, durationMs, correlationId: id } }), { status: 200, headers: { 'X-Correlation-Id': id } });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
-    log({ t: 'error', stage: 'unhandled', kind: 'unexpected', message });
+  log({ t: 'error', stage: 'unhandled', kind: 'unexpected', message, memRss: process.memoryUsage().rss });
     return new Response(JSON.stringify({ error: 'Internal server error', correlationId: id }), { status: 500, headers: { 'X-Correlation-Id': id } });
   }
 }
