@@ -49,13 +49,6 @@ export async function POST(req: NextRequest) {
       } catch { /* ignore logging errors */ }
     }
     interface IncomingImage { data: string; mimeType?: string }
-  // Gemini 送信用パート型 (テキスト or インライン画像)
-  interface GeminiInlinePart { inlineData: { mimeType?: string; data?: string } }
-  interface GeminiTextPart { text: string }
-  type GeminiReqPart = GeminiInlinePart | GeminiTextPart;
-  interface GeminiRequestBody { contents: { role: string; parts: GeminiReqPart[] }[] }
-  const isTextPart = (p: GeminiReqPart): p is GeminiTextPart => 'text' in p;
-  const isInlinePart = (p: GeminiReqPart): p is GeminiInlinePart => 'inlineData' in p;
     const contentType = req.headers.get('content-type') || '';
     let prompt: string | null = null;
     let model: string = 'gemini-2.5-flash-image-preview';
@@ -150,7 +143,7 @@ export async function POST(req: NextRequest) {
     if (debugMode) {
       try {
         const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-        const geminiBody: GeminiRequestBody = {
+        const geminiBody = {
           contents: [
             {
               role: 'user',
@@ -161,35 +154,6 @@ export async function POST(req: NextRequest) {
             }
           ]
         };
-        // 送信直前ボディログ (400 Bad Request 切り分け用)
-        try {
-          const full = process.env.LOG_GEMINI_BODY === '1' || req.nextUrl?.searchParams?.get('body') === '1';
-          const sanitize = (body: GeminiRequestBody) => {
-            if (full) return body; // 注意: 画像 Base64 を含む
-            return {
-              contents: body.contents.map(c => ({
-                role: c.role,
-                parts: c.parts.map(p => {
-                  if (isTextPart(p)) {
-                    const textVal = p.text;
-                    return { text: textVal.length > 400 ? textVal.slice(0,400) + `...(+${textVal.length-400} chars)` : textVal };
-                  }
-                  if (isInlinePart(p)) {
-                    const d = p.inlineData.data;
-                    return {
-                      inlineData: {
-                        mimeType: p.inlineData.mimeType,
-                        data: d ? `<base64 length=${d.length}>` : '<missing>'
-                      }
-                    };
-                  }
-                  return p;
-                })
-              }))
-            };
-          };
-          log({ t: 'upstream_request_body', debug: true, model, full, body: sanitize(geminiBody) });
-        } catch { /* ignore logging errors */ }
         const upstreamStarted = Date.now();
         const upstreamRes = await fetch(GEMINI_URL, {
           method: 'POST',
@@ -207,7 +171,7 @@ export async function POST(req: NextRequest) {
 
     // --- Upstream (Gemini) 呼び出し: raw fetch で status と本文を完全把握 ---
     const upstreamUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const upstreamBody: GeminiRequestBody = {
+    const upstreamBody = {
       contents: [
         {
           role: 'user',
@@ -218,65 +182,6 @@ export async function POST(req: NextRequest) {
         }
       ]
     };
-    // 追加オプション検証 (?validate=1 または env VALIDATE_INLINE=1)
-    const doValidate = req.nextUrl?.searchParams?.get('validate') === '1' || process.env.VALIDATE_INLINE === '1';
-    if (doValidate) {
-      try {
-        const bodyParts = upstreamBody.contents[0]?.parts || [];
-        const stats: { idx: number; type: string; [k: string]: unknown }[] = [];
-        bodyParts.forEach((p, idx) => {
-          if (isInlinePart(p)) {
-            const d = p.inlineData.data;
-            let decodedLen: number | null = null;
-            let base64Ok = true;
-            if (typeof d === 'string') {
-              try { decodedLen = Buffer.from(d, 'base64').length; } catch { base64Ok = false; }
-            }
-            stats.push({
-              idx,
-              type: 'image',
-              mimeType: p.inlineData.mimeType,
-              base64Len: d?.length || 0,
-              head24: d ? d.slice(0,24) : null,
-              tail24: d ? d.slice(-24) : null,
-              decodedLen,
-              base64Ok
-            });
-          } else if (isTextPart(p)) {
-            const t = p.text;
-            stats.push({ idx, type: 'text', textLen: t.length, empty: t.trim().length === 0 });
-          } else {
-            stats.push({ idx, type: 'unknown' });
-          }
-        });
-        log({ t: 'validate_parts', count: bodyParts.length, stats });
-      } catch (err) {
-        log({ t: 'error', stage: 'validate_inline', message: err instanceof Error ? err.message : String(err) });
-      }
-    }
-    // Upstream 呼び出し前の本番向けサニタイズログ (400 原因特定用)
-    try {
-      const full = process.env.LOG_GEMINI_BODY === '1' || req.nextUrl?.searchParams?.get('body') === '1';
-      const summarize = (body: GeminiRequestBody) => {
-        if (full) return body;
-        return {
-          contents: body.contents.map(c => ({
-            role: c.role,
-            parts: c.parts.map(p => {
-              if (isTextPart(p)) {
-                return { textPreview: p.text.slice(0,160), textLen: p.text.length };
-              }
-              if (isInlinePart(p)) {
-                const d = p.inlineData.data;
-                return { inlineData: { mimeType: p.inlineData.mimeType, base64Len: d?.length || 0 } };
-              }
-              return { kind: 'unknown_part' };
-            })
-          }))
-        };
-      };
-      log({ t: 'upstream_request_body', model, full, body: summarize(upstreamBody) });
-    } catch { /* ignore logging errors */ }
     const started = Date.now();
     log({ t: 'fetch', phase: 'start', memRss: process.memoryUsage().rss, upstreamUrl });
   let upstreamStatus: number | undefined;
@@ -304,20 +209,9 @@ export async function POST(req: NextRequest) {
       const durationMs = Date.now() - started;
       log({ t: 'fetch', phase: 'end', ms: durationMs, upstreamStatus, bodyLen, memRss: process.memoryUsage().rss });
       if (!upstreamRes.ok) {
-        const snippet = text.slice(0, 600);
-        let parsedErr: any = null;
-        try { parsedErr = JSON.parse(text); } catch { /* ignore */ }
-        log({ t: 'error', stage: 'upstream', kind: 'non_200', upstreamStatus, snippetLen: snippet.length, hasJson: !!parsedErr });
-        return new Response(
-          JSON.stringify({
-            error: 'Upstream non-200',
-            upstreamStatus,
-            snippet,
-            upstreamError: parsedErr?.error || null,
-            correlationId: id
-          }),
-          { status: 502, headers: { 'X-Correlation-Id': id } }
-        );
+        const snippet = text.slice(0, 300);
+        log({ t: 'error', stage: 'upstream', kind: 'non_200', upstreamStatus, snippetLen: snippet.length });
+        return new Response(JSON.stringify({ error: 'Upstream non-200', upstreamStatus, snippet, correlationId: id }), { status: 502, headers: { 'X-Correlation-Id': id } });
       }
     } catch (err) {
       log({ t: 'error', stage: 'upstream', kind: 'fetch_throw', message: err instanceof Error ? err.message : String(err) });
@@ -338,7 +232,7 @@ export async function POST(req: NextRequest) {
       const buf = Buffer.from(imgPart.inlineData.data, 'base64');
       const totalMsRaw = Date.now() - startedAll;
       log({ t: 'complete', totalMs: totalMsRaw, raw: true, memRss: process.memoryUsage().rss });
-  return new Response(buf, { status: 200, headers: { 'Content-Type': 'image/png', 'X-Correlation-Id': id, 'X-Upstream-Status': String(upstreamStatus || 200) } });
+      return new Response(buf, { status: 200, headers: { 'Content-Type': 'image/png', 'X-Correlation-Id': id } });
     }
     log({ t: 'result', imageBytes, durationMs, memRss: process.memoryUsage().rss });
     const totalMs = Date.now() - startedAll;
