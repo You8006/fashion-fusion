@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useMemo } from 'react';
 // Remove direct GoogleGenAI usage; use server proxy
-import { callGenAI } from '@/lib/genai-client';
+import { callGenAI, callGenAIMultipart } from '@/lib/genai-client';
 import { buildCompositePrompt, buildItemColorGridPrompt } from '@/lib/prompt-builders';
 import { sizeFromFile, enforceSizeB64 as enforceSizeB64Strict, downloadB64PNG, clampLongEdgeSize } from '@/lib/size-utils';
 import { sliceGridB64, assembleGridB64 } from '@/lib/grid-utils';
@@ -54,18 +54,14 @@ export default function MiniPage() {
       if (!personFile || !itemFile) { setError('Select person + item images'); return; }
       if (!baseW || !baseH) { setError('Base size missing'); return; }
       setBusy(true);
-      const person = await toInline(personFile);
-      const item = await toInline(itemFile);
-      // Payload size pre-check
-      const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
-      const totalBytes = base64Bytes(person.inlineData.data!) + base64Bytes(item.inlineData.data!);
-      if (totalBytes > 3.5 * 1024 * 1024) {
-        setError(`Payload too large (≈${(totalBytes/1024/1024).toFixed(2)}MB). Resize images below 3.5MB combined.`);
+      const rawTotal = personFile.size + itemFile.size;
+      if (rawTotal > 3.9 * 1024 * 1024) {
+        setError(`Payload too large raw ${(rawTotal/1024/1024).toFixed(2)}MB (>3.9MB).`);
         setBusy(false);
         return;
       }
       const prompt = buildCompositePrompt(baseW, baseH);
-      const res = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
+      const res = await callGenAIMultipart({ prompt, files: [ { file: personFile }, { file: itemFile } ] });
       if (!res.imageB64) throw new Error('No image returned');
       const normalized = await enforceSizeB64Strict(res.imageB64, baseW, baseH, 'cover');
       setResultB64(normalized);
@@ -86,20 +82,18 @@ export default function MiniPage() {
       const itemPrompt = buildItemColorGridPrompt([
         '#FF0000','#0055FF','#FFD700','#00B140','#7A00FF','#FF7A00','#000000','#FFFFFF','#808080'
       ], cellW, cellH);
-      const itemInline = await toInline(itemFile);
-      const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
-      const totalBytesSingle = base64Bytes(itemInline.inlineData.data!);
-      if (totalBytesSingle > 3.5 * 1024 * 1024) {
-        setError(`Item image too large (≈${(totalBytesSingle/1024/1024).toFixed(2)}MB) for grid request.`);
+      // First call (item color grid) can also use multipart (single file)
+      if (itemFile.size > 3.9 * 1024 * 1024) {
+        setError(`Item file too large ${(itemFile.size/1024/1024).toFixed(2)}MB (>3.9MB).`);
         setBusy(false);
         return;
       }
-      const itemGridRes = await callGenAI({ prompt: itemPrompt, images: [ { data: itemInline.inlineData.data!, mimeType: itemInline.inlineData.mimeType } ] });
+      const itemGridRes = await callGenAIMultipart({ prompt: itemPrompt, files: [ { file: itemFile } ] });
       if (!itemGridRes.imageB64) throw new Error('Item color grid failed');
       const itemGridNorm = await enforceSizeB64Strict(itemGridRes.imageB64, cellW * 3, cellH * 3, 'cover');
       const itemCells = await sliceGridB64(itemGridNorm, 3, 3, cellW, cellH);
       if (itemCells.length !== 9) throw new Error('Failed to slice 9 cells');
-      const personInline = await toInline(personFile);
+  const personInline = await toInline(personFile); // reuse existing inline path for per-cell composites (kept JSON for simplicity)
       const compositeCells: string[] = [];
       for (let i = 0; i < 9; i++) {
         const compPrompt = buildCompositePrompt(cellW, cellH) + '\nMODE=single_color_variant_cell index=' + i;

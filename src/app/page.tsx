@@ -10,7 +10,7 @@ import { sizeFromFile, sizeFromB64, enforceSizeB64 as enforceSizeB64Strict, down
 import { sizeHint } from "@/lib/prompt-size-hint";
 // Legacy prompt helpers removed (now unified via prompt-builders)
 import { buildCompositePrompt, buildColorGridPrompt } from "@/lib/prompt-builders";
-import { callGenAI } from "@/lib/genai-client";
+import { callGenAI, callGenAIMultipart } from "@/lib/genai-client";
 
 // Minimal structural type for Gemini image parts to avoid using 'any'
 interface GenAIInlinePart { inlineData?: { data?: string; mimeType?: string } }
@@ -122,19 +122,16 @@ export default function Page() {
       if (!personFile || !itemFile) { setError("Please select both a person image and an item image"); return; }
       if (!baseW || !baseH) { setError("Failed to get person image size"); return; }
       setState("working");
-      const person = await toInlineData(personFile);
-      const item = await toInlineData(itemFile);
-      // === Payload size pre-check (Base64 -> bytes ≈ length * 3/4) ===
-      const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
-      const totalBytes = base64Bytes(person.inlineData!.data!) + base64Bytes(item.inlineData!.data!);
-      const WARN_LIMIT = 3.5 * 1024 * 1024; // 3.5MB (approx) safety margin below SWA Functions 4MB
-      if (totalBytes > WARN_LIMIT) {
-        setError(`Payload too large (≈${(totalBytes/1024/1024).toFixed(2)}MB). Please resize images or choose smaller ones (<3.5MB combined).`);
+      // Raw file size 合計で判定 (multipart 送信前)
+      const totalRaw = personFile.size + itemFile.size;
+      const RAW_WARN = 3.9 * 1024 * 1024; // ほぼ 4MB 手前の安全域
+      if (totalRaw > RAW_WARN) {
+        setError(`Payload too large raw ${(totalRaw/1024/1024).toFixed(2)}MB (>3.9MB). Please resize images.`);
         setState('idle');
         return;
       }
       const prompt = buildCompositePrompt(baseW, baseH);
-      const response = await callGenAI({ prompt, images: [ person.inlineData, item.inlineData ].map(p => ({ data: p.data!, mimeType: p.mimeType })) });
+      const response = await callGenAIMultipart({ prompt, files: [ { file: personFile }, { file: itemFile } ] });
       if (!response.imageB64) throw new Error('No image returned');
       const rawB64 = response.imageB64;
       let outW = baseW, outH = baseH;
@@ -212,7 +209,7 @@ export default function Page() {
         setGeneratingColor(false);
         return;
       }
-      const res = await callGenAI({ prompt, images: [ { data: (resultB64 || ''), mimeType: 'image/png' } ] });
+  const res = await callGenAI({ prompt, images: [ { data: (resultB64 || ''), mimeType: 'image/png' } ] });
       if (!res.imageB64) throw new Error('Color grid not returned');
       const grid = await enforceSizeB64Strict(res.imageB64, gridW, gridH, 'cover');
       setColorGridB64(grid);

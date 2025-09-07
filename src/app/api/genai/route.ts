@@ -30,43 +30,80 @@ export async function POST(req: NextRequest) {
       } catch { /* ignore logging errors */ }
     }
     interface IncomingImage { data: string; mimeType?: string }
-    interface IncomingBody { prompt?: unknown; images?: unknown; model?: unknown }
-    let body: IncomingBody;
-    try { body = await req.json(); } catch {
-      log({ t: 'error', stage: 'parse', kind: 'invalid_json' });
-      return new Response(JSON.stringify({ error: 'Invalid JSON', correlationId: id }), { status: 400, headers: { 'X-Correlation-Id': id } });
+    const contentType = req.headers.get('content-type') || '';
+    let prompt: string | null = null;
+    let model: string = 'gemini-2.5-flash-image-preview';
+    let images: IncomingImage[] = [];
+    let rawBytesTotal = 0; // multipart raw bytes (sum of file.size)
+
+    if (contentType.includes('multipart/form-data')) {
+      // Multipart: FormData 経由 (推奨ルート)
+      let form: FormData;
+      try { form = await req.formData(); } catch {
+        log({ t: 'error', stage: 'parse', kind: 'multipart_parse_error' });
+        return new Response(JSON.stringify({ error: 'Invalid multipart form', correlationId: id }), { status: 400, headers: { 'X-Correlation-Id': id } });
+      }
+      const p = form.get('prompt');
+      if (typeof p === 'string') prompt = p; else prompt = null;
+      const m = form.get('model');
+      if (typeof m === 'string' && m.trim()) model = m.trim();
+      const files = form.getAll('images');
+      for (const f of files) {
+        if (f instanceof File) {
+          const size = f.size;
+            rawBytesTotal += size;
+            // Convert to base64 (Gemini SDK expects inlineData base64)
+            const ab = await f.arrayBuffer();
+            const b64 = Buffer.from(ab).toString('base64');
+            images.push({ data: b64, mimeType: f.type || 'image/png' });
+        }
+      }
+      log({ t: 'multipart', imagesFiles: files.length, accepted: images.length, rawBytesTotal });
+    } else {
+      // JSON: 従来 Base64 埋め込み
+      interface IncomingBody { prompt?: unknown; images?: unknown; model?: unknown }
+      let body: IncomingBody;
+      try { body = await req.json(); } catch {
+        log({ t: 'error', stage: 'parse', kind: 'invalid_json' });
+        return new Response(JSON.stringify({ error: 'Invalid JSON', correlationId: id }), { status: 400, headers: { 'X-Correlation-Id': id } });
+      }
+      const promptRaw = body?.prompt;
+      const imagesRaw = body?.images;
+      const modelRaw = body?.model;
+      if (typeof promptRaw === 'string') prompt = promptRaw; else prompt = null;
+      if (typeof modelRaw === 'string') model = modelRaw; else model = 'gemini-2.5-flash-image-preview';
+      images = Array.isArray(imagesRaw)
+        ? (imagesRaw as unknown[]).filter((val): val is IncomingImage => {
+            if (typeof val !== 'object' || val === null) return false;
+            if (!('data' in val)) return false;
+            const data = (val as { data: unknown }).data;
+            return typeof data === 'string';
+          })
+        : [];
     }
-    const promptRaw = body?.prompt;
-    const imagesRaw = body?.images;
-    const modelRaw = body?.model;
-    if (typeof promptRaw !== 'string') {
+
+    if (!prompt) {
       log({ t: 'error', stage: 'validate', kind: 'missing_prompt' });
       return new Response(JSON.stringify({ error: 'Missing prompt', correlationId: id }), { status: 400, headers: { 'X-Correlation-Id': id } });
     }
-    const prompt = promptRaw;
-    const images: IncomingImage[] = Array.isArray(imagesRaw)
-      ? (imagesRaw as unknown[]).filter((val): val is IncomingImage => {
-          if (typeof val !== 'object' || val === null) return false;
-          if (!('data' in val)) return false;
-          const data = (val as { data: unknown }).data;
-          return typeof data === 'string';
-        })
-      : [];
-    const model = typeof modelRaw === 'string' ? modelRaw : 'gemini-2.5-flash-image-preview';
     if (images.length > 6) {
       log({ t: 'error', stage: 'validate', kind: 'too_many_images', count: images.length });
       return new Response(JSON.stringify({ error: 'Too many images (max 6)', correlationId: id }), { status: 400, headers: { 'X-Correlation-Id': id } });
     }
-    // Total payload size estimation (Base64 → bytes ≈ len * 0.75)
+    // サイズ評価: multipart なら rawBytesTotal / JSON なら推定
     const base64Bytes = (b64: string) => Math.floor(b64.length * 0.75);
-    let totalImageBytes = 0;
-    for (const img of images) totalImageBytes += base64Bytes(img.data);
-    const RAW_LIMIT = 4 * 1024 * 1024; // Safety for platform body size
-    const WARN_LIMIT = 3.9 * 1024 * 1024;
-    if (totalImageBytes >= WARN_LIMIT) {
-      log({ t: 'error', stage: 'validate', kind: 'payload_too_large', totalImageBytes });
+    let totalImageBytes: number;
+    if (contentType.includes('multipart/form-data')) {
+      totalImageBytes = rawBytesTotal; // 実バイト
+    } else {
+      let sum = 0; for (const img of images) sum += base64Bytes(img.data); totalImageBytes = sum;
+    }
+    const LIMIT_WARN = 3.9 * 1024 * 1024; // ほぼ 4MB 制限に対する余裕
+    if (totalImageBytes >= LIMIT_WARN) {
+      log({ t: 'error', stage: 'validate', kind: 'payload_too_large', totalImageBytes, multipart: contentType.includes('multipart/form-data') });
       return new Response(JSON.stringify({ error: 'Payload too large (>=3.9MB). Resize images.', correlationId: id }), { status: 413, headers: { 'X-Correlation-Id': id } });
     }
+    // 個別画像 8MB ガード (Base64換算は JSON 経路のみ)
     for (const img of images) {
       const approx = base64Bytes(img.data);
       if (approx > 8 * 1024 * 1024) {
@@ -74,7 +111,39 @@ export async function POST(req: NextRequest) {
         return new Response(JSON.stringify({ error: 'Image too large (>8MB)', correlationId: id }), { status: 400, headers: { 'X-Correlation-Id': id } });
       }
     }
-    log({ t: 'request', images: images.length, totalImageBytes, model, promptPreview: prompt.slice(0, 160) });
+    log({ t: 'request', images: images.length, totalImageBytes, model, promptPreview: prompt.slice(0, 160), multipart: contentType.includes('multipart/form-data') });
+
+    // --- Debug pass-through mode (raw Gemini API) ---
+    const debugMode = req.nextUrl?.searchParams?.get('debug') === '1' || req.headers.get('x-debug-upstream') === '1';
+    if (debugMode) {
+      try {
+        const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        const geminiBody = {
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: prompt },
+                ...images.map(im => ({ inlineData: { mimeType: im.mimeType || 'image/png', data: im.data } }))
+              ]
+            }
+          ]
+        };
+        const upstreamStarted = Date.now();
+        const upstreamRes = await fetch(GEMINI_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(geminiBody)
+        });
+        const upstreamText = await upstreamRes.text();
+        log({ t: 'upstream_debug', status: upstreamRes.status, bodyLen: upstreamText.length, ms: Date.now() - upstreamStarted });
+        return new Response(JSON.stringify({ debug: true, upstreamStatus: upstreamRes.status, upstreamBody: upstreamText, correlationId: id }), { status: 200, headers: { 'X-Correlation-Id': id } });
+      } catch (err) {
+        log({ t: 'error', stage: 'upstream_debug', kind: 'exception', message: err instanceof Error ? err.message : String(err) });
+        return new Response(JSON.stringify({ error: 'Upstream debug failed', correlationId: id }), { status: 500, headers: { 'X-Correlation-Id': id } });
+      }
+    }
+
     const ai = new GoogleGenAI({ apiKey });
     const contents = [ { text: prompt }, ...images.map(im => ({ inlineData: { mimeType: im.mimeType || 'image/png', data: im.data } })) ];
     const started = Date.now();
