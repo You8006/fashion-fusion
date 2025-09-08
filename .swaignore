@@ -1,0 +1,14 @@
+# Exclude build caches and unnecessary artifacts from upload
+
+.next/cache
+.next/turbopack
+.next/trace
+
+# Local tooling
+
+.vscode
+\*.log
+
+# Already ignored by .gitignore but ensure here too
+
+node_modules

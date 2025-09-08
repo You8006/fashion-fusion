@@ -35,8 +35,8 @@ jobs:
           # For more information regarding Static Web App workflow configurations, please visit: https://aka.ms/swaworkflowconfig
           app_location: "/" # App source code path
           api_location: "" # Api source code path - optional
-          # 明示: Next.js ビルド成果物ディレクトリ (.next) を指定し不要ファイルの推測アップロードを防ぐ
-          output_location: ".next" # Built app content directory
+          # output_location を空に戻し Oryx に自動検出させる（.next 全体の直接アップロードを避ける）
+          output_location: "" # Let SWA detect .next internally
           ###### End of Repository/Build Configurations ######
         env:
           NEXT_TELEMETRY_DISABLED: 1
