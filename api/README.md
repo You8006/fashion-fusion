@@ -8,4 +8,5 @@ Next step idea:
 
 - Create `api/generate/index.ts` (JavaScript) function
 - Move API key to environment (SWA backend) and call Gemini server-side
+
 - Validate and size-limit images, enforce rate limiting
