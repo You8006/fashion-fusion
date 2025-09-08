@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "next dev --turbopack",
-  "build": "next build",
+    "build": "next build",
     "start": "next start",
     "lint": "eslint",
     "demo:nano": "tsx scripts/nano-banana-demo.ts"
@@ -15,14 +15,14 @@
   "dependencies": {
     "@google/genai": "^1.17.0",
     "next": "15.5.2",
-    "react": "19.1.0",
-    "react-dom": "19.1.0"
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
     "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
     "eslint": "^9",
     "eslint-config-next": "15.5.2",
     "tsx": "^4.19.1",
